@@ -1,0 +1,22 @@
+{
+  "secrets": [
+    {
+      "key": "ECHO_APP_PUBKEY",
+      "description": "On-chain address that incoming sends are echoed back from. Generate with `usernode-cli account generate`; paste the `address` field here.",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "key": "ECHO_APP_SECRET_KEY",
+      "description": "Secret key paired with ECHO_APP_PUBKEY. Used by the echo signer to send replies. Never logged or returned via the API.",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "key": "NODE_RPC_URL",
+      "description": "Sidecar usernode RPC endpoint. Defaults to the in-network node service.",
+      "required": false,
+      "default": "http://usernode-node:3000"
+    }
+  ]
+}
