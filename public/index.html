@@ -314,7 +314,11 @@
       window.localStorage.getItem("echo:app_pubkey") ||
       "ut1rfa6arxcy84ysusvfg309ly6guk3kch9qvgktn32d88xk704u5tsges8uh";
 
-    const TX_SEND_OPTS = { timeoutMs: 90000, pollIntervalMs: 1500 };
+    // Sending wait budget: how long the bridge polls /transactions for the
+    // user's outbound tx after the wallet returns "queued". Sized to the
+    // worst-case mempool/inclusion latency we still consider "the network
+    // is just slow today", not "this tx is dropped".
+    const TX_SEND_OPTS = { timeoutMs: 180000, pollIntervalMs: 1500 };
     // Bump STORAGE_VERSION whenever the persisted history shape changes
     // (or any other echo:* key's shape changes). loadHistory() purges
     // older versions on startup so stale entries from previous deploys —
@@ -442,8 +446,21 @@
 
        This matters because chain confirmation is ~30-60s; without a
        persistent visual after the user's tx confirms, the UI looks
-       frozen even though the echo round-trip is the longest part. */
-    const TX_PB_EXPECTED_S = 30, TX_PB_WARN_S = 45, TX_PB_ERR_S = 90;
+       frozen even though the echo round-trip is the longest part.
+
+       Both phases share the same escalation shape — green → amber at
+       WARN_S → red at ERR_S — and both top out at 3 minutes. The send
+       phase fails through TX_SEND_OPTS.timeoutMs (the bridge times
+       out and rejects); the echo phase fails through the explicit
+       timeout in startEchoPhaseProgressBar's tick (no chain-side
+       signal to depend on). */
+    const TX_PB_EXPECTED_S = 60, TX_PB_WARN_S = 120, TX_PB_ERR_S = 180;
+    // Echo-receive escalation: visual amber → red at WARN_S, then a
+    // hard fail at ERR_S so a stuck "echoing" entry doesn't tick
+    // upward forever. ERR_S matches TX_SEND_OPTS.timeoutMs so a user
+    // who sees "Echo not received after 3m" can intuit "we already
+    // gave the underlying chain the same patience, twice — give up".
+    const ECHO_RECV_WARN_S = 120, ECHO_RECV_ERR_S = 180;
     let _pbRaf = null;
     let _pbPhase = "idle"; // "idle" | "sending" | "echoing" | "done"
     let _pbSendStart = 0;
@@ -579,11 +596,41 @@
       const tick = () => {
         if (_pbPhase !== "echoing") return;
         const s = (performance.now() - _pbEchoStart) / 1000;
+        // Hard fail at ECHO_RECV_ERR_S: nothing on the chain side will
+        // tell us "the echo isn't coming", so we have to draw the line
+        // ourselves. After this we leave the entry as `failed` and the
+        // UI is no longer live; if the echo eventually arrives a later
+        // pollServerState() pass will retroactively flip it to confirmed.
+        if (s >= ECHO_RECV_ERR_S) {
+          failEchoPhaseDueToTimeout(trackingTxId);
+          return;
+        }
         const text = "Waiting for echo… " + (s < 10 ? s.toFixed(1) : Math.round(s)) + "s";
-        pbSetLabel(text, "tx-progress-label warn", true);
+        const labelClass = s >= ECHO_RECV_WARN_S ? "tx-progress-label err" : "tx-progress-label warn";
+        pbSetLabel(text, labelClass, s < ECHO_RECV_WARN_S);
         _pbRaf = setTimeout(tick, PB_TICK_MS);
       };
       tick();
+    }
+
+    // Echo never arrived within ECHO_RECV_ERR_S — surface that to the
+    // history row (so it stops looking live) and to the progress bar
+    // (so the user sees a discrete "we gave up" terminus instead of
+    // a counter that ticks past 3 minutes). pollServerState may later
+    // overwrite status back to "confirmed" if the echo eventually
+    // lands; that's intentional — late truth wins over a guessed fail.
+    function failEchoPhaseDueToTimeout(txId) {
+      if (txId) {
+        const entry = history.find((h) => h.requestTxId === txId);
+        if (entry && entry.status === "echoing") {
+          entry.status = "failed";
+          entry.error = entry.error || "Echo not received within 3 minutes.";
+          persistHistory();
+          if (history[0] === entry) renderLatest(entry);
+          renderHistory();
+        }
+      }
+      failProgressBar("Echo not received after 3m");
     }
 
     /* Echo arrived — show green completion + total round-trip, then hide. */
