@@ -55,14 +55,30 @@
   // social-vibecoding parent and embedded dapps run on different ports.
   var _BRIDGE_TAG = "[bridge " + (_inIframe ? "iframe" : "top") + " " +
     (typeof location !== "undefined" ? location.host : "?") + "]";
-  // Loud one-shot probe: this fires every time the bridge script
-  // evaluates, in every frame that loads it. If we don't see this line
-  // for the iframe in `flutter run` output, the iframe didn't load (or
-  // didn't load this bridge) — and any debugging of relay logic is
-  // pointless until that's fixed.
   console.log(_BRIDGE_TAG, "loaded; inIframe=" + _inIframe +
     " hasNativeChannel=" + _hasNativeChannel +
     " hasUsernode=" + (typeof window.Usernode));
+
+  // Android WebView injects `window.Usernode` into ALL frames, including
+  // cross-origin iframes — so naively `_hasNativeChannel` is true here
+  // too, and outgoing `Usernode.postMessage` calls from an iframe DO
+  // reach Flutter. The catch is the response leg: Flutter resolves
+  // promises with `controller.runJavaScript("window.__usernodeResolve(…)")`,
+  // and `runJavaScript` evaluates ONLY in the top frame. The iframe's
+  // pending-id map lives in the iframe's own `window`, so resolutions
+  // sent to the top frame never land — every iframe-initiated promise
+  // hangs forever.
+  //
+  // Forcing the iframe through the parent relay fixes this end-to-end:
+  // requests go iframe → parent → Flutter (top-frame Usernode), and
+  // resolutions go Flutter → top frame → parent (which IS where
+  // runJavaScript runs) → iframe via `postMessage`.
+  if (_inIframe && _hasNativeChannel) {
+    console.log(_BRIDGE_TAG,
+      "ignoring iframe-injected Usernode (Flutter resolves only in top frame);" +
+      " routing through parent relay");
+    _hasNativeChannel = false;
+  }
 
   // Optimistic: only true once the parent has positively confirmed it has a
   // native channel for us to relay through.
