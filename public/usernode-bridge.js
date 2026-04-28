@@ -20,10 +20,35 @@
 
 (function () {
   window.usernode = window.usernode || {};
-  // "dapp mode" (inside the Flutter WebView) exposes a JS channel object named
-  // `Usernode` with a `postMessage` function.
-  window.usernode.isNative =
+
+  // ── Native + iframe-relay detection ───────────────────────────────────
+  //
+  // "dapp mode" (top frame inside the Flutter WebView) exposes a JS channel
+  // object named `Usernode` with a `postMessage` function.
+  //
+  // When a dapp is embedded inside another page (e.g. the social-vibecoding
+  // platform loads dapps in cross-origin iframes), Flutter's WebView only
+  // injects `window.Usernode` into the top frame — child frames see
+  // `window.Usernode === undefined`. To keep dapps working transparently
+  // inside iframes, we relay native calls through the parent window via
+  // `postMessage`. The parent's copy of this bridge installs a listener
+  // (further down) that forwards relayed requests to `Usernode.postMessage`
+  // and routes responses back to the originating iframe.
+  //
+  // Detection:
+  //   * If we have direct access to `window.Usernode` → use it (top frame).
+  //   * Else if we're inside an iframe → assume the parent runs this same
+  //     bridge and relay through `window.parent.postMessage`. If the parent
+  //     does not have a relay listener (e.g. embedded outside the platform
+  //     in a regular browser tab), calls will time out via the existing
+  //     pending-promise machinery — same outcome as before this patch.
+  var _hasNativeChannel =
     !!window.Usernode && typeof window.Usernode.postMessage === "function";
+  var _inIframe = false;
+  try { _inIframe = window !== window.parent; } catch (_) { _inIframe = false; }
+  var _useIframeRelay = !_hasNativeChannel && _inIframe;
+
+  window.usernode.isNative = _hasNativeChannel || _useIframeRelay;
 
   // ── Configuration for QR/desktop mode ─────────────────────────────────
   // Apps call window.usernode.configure({ address: "ut1..." }) to set the
@@ -51,12 +76,82 @@
     var id = String(Date.now()) + "-" + Math.random().toString(16).slice(2);
     return new Promise(function (resolve, reject) {
       window.__usernodeBridge.pending[id] = { resolve: resolve, reject: reject };
-      if (!window.usernode.isNative) {
-        delete window.__usernodeBridge.pending[id];
-        reject(new Error("Usernode native bridge not available"));
+      var payload = { method: method, id: id, args: args || {} };
+      if (_useIframeRelay) {
+        try {
+          window.parent.postMessage(
+            { __usernode_relay: "request", id: id, method: method, args: args || {} },
+            "*"
+          );
+        } catch (err) {
+          delete window.__usernodeBridge.pending[id];
+          reject(err);
+        }
         return;
       }
-      window.Usernode.postMessage(JSON.stringify({ method: method, id: id, args: args || {} }));
+      if (_hasNativeChannel) {
+        window.Usernode.postMessage(JSON.stringify(payload));
+        return;
+      }
+      delete window.__usernodeBridge.pending[id];
+      reject(new Error("Usernode native bridge not available"));
+    });
+  }
+
+  // ── Iframe-relay client: receive responses from the parent ────────────
+  // The parent forwards Flutter's reply as
+  //   { __usernode_relay: "response", id, value, error }
+  // Funnel into the existing `__usernodeResolve` plumbing so the rest of
+  // the bridge does not need to know about the relay path.
+  if (_useIframeRelay) {
+    window.addEventListener("message", function (e) {
+      var data = e.data;
+      if (!data || data.__usernode_relay !== "response") return;
+      // Only accept responses from our parent frame.
+      if (e.source !== window.parent) return;
+      window.__usernodeResolve(data.id, data.value, data.error);
+    });
+  }
+
+  // ── Iframe-relay server: forward child-iframe requests to native ──────
+  // When this bridge runs in the top frame and the native channel is
+  // available, listen for relay requests from embedded dapps (cross-origin
+  // iframes) and pass them straight through to the Flutter JS channel.
+  // This deliberately bypasses the parent page's own dispatch wrappers
+  // (mock detection, QR fallback) — the iframe already runs its own copy
+  // of this bridge and is responsible for those decisions in its own
+  // origin. The parent only relays raw Usernode.postMessage payloads.
+  if (_hasNativeChannel) {
+    window.addEventListener("message", function (e) {
+      var data = e.data;
+      if (!data || data.__usernode_relay !== "request" || !e.source) return;
+      var origId = data.id;
+      var origin = e.origin || "*";
+      var source = e.source;
+      var nativeId = "relay-" + String(Date.now()) + "-" +
+        Math.random().toString(16).slice(2);
+      function reply(value, error) {
+        try {
+          source.postMessage(
+            { __usernode_relay: "response", id: origId, value: value, error: error },
+            origin
+          );
+        } catch (_) { /* iframe gone, ignore */ }
+      }
+      window.__usernodeBridge.pending[nativeId] = {
+        resolve: function (v) { reply(v, null); },
+        reject: function (err) { reply(null, (err && err.message) || String(err)); },
+      };
+      try {
+        window.Usernode.postMessage(JSON.stringify({
+          method: data.method,
+          id: nativeId,
+          args: data.args || {},
+        }));
+      } catch (err) {
+        delete window.__usernodeBridge.pending[nativeId];
+        reply(null, (err && err.message) || String(err));
+      }
     });
   }
 
