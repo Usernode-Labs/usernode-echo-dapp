@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Echo — Usernode latency test</title>
+  <script src="/usernode-bridge.js"></script>
+  <script src="/usernode-usernames.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fb;
+      --fg: #0b1220;
+      --muted: #4b5568;
+      --card: #ffffff;
+      --border: rgba(15, 23, 42, 0.12);
+      --accent: #2563eb;
+      --ok: #0f766e;
+      --warn: #ca8a04;
+      --err: #c81e1e;
+      --chip-bg: rgba(37, 99, 235, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f16;
+        --fg: #e7edf7;
+        --muted: #a8b3c7;
+        --card: #141b26;
+        --border: rgba(255, 255, 255, 0.12);
+        --accent: #6ea8fe;
+        --ok: #5dd39e;
+        --warn: #e6a817;
+        --err: #ff6b6b;
+        --chip-bg: rgba(110, 168, 254, 0.12);
+      }
+    }
+    html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+        Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: var(--bg); color: var(--fg);
+      display: flex; flex-direction: column;
+      height: 100vh; height: 100dvh; overflow: hidden;
+    }
+    .topBar {
+      flex: 0 0 auto;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--card);
+    }
+    .topBar-inner {
+      max-width: 720px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .topBar h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.1px; }
+    .topBar .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .modePill {
+      font-size: 11px; font-weight: 600;
+      padding: 3px 10px; border-radius: 999px;
+      background: var(--chip-bg); color: var(--accent);
+      border: 1px solid var(--border);
+    }
+    .scrollArea {
+      flex: 1 1 auto; overflow-y: auto; min-height: 0;
+      padding-bottom: max(16px, env(safe-area-inset-bottom));
+    }
+    main {
+      max-width: 720px; margin: 0 auto;
+      padding: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input[type="number"] {
+      width: 100%; padding: 10px 12px;
+      font-size: 16px; font-family: inherit;
+      background: transparent; color: var(--fg);
+      border: 1px solid var(--border); border-radius: 8px;
+      -webkit-appearance: none; appearance: none;
+    }
+    input[type="number"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .row { display: flex; gap: 10px; align-items: stretch; }
+    .row > * { flex: 1 1 auto; }
+    button.primary {
+      flex: 0 0 auto;
+      min-width: 120px;
+      padding: 10px 18px;
+      font-size: 15px; font-weight: 600;
+      background: var(--accent); color: #fff;
+      border: 0; border-radius: 8px;
+      cursor: pointer;
+    }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .hint {
+      font-size: 12px; color: var(--muted); margin-top: 8px;
+    }
+    .err { color: var(--err); }
+
+    /* Progress bar */
+    .tx-progress { width: 100%; margin: 12px 0 0; }
+    .tx-progress.hide { display: none; }
+    .tx-progress-track {
+      width: 100%; height: 6px; border-radius: 3px;
+      background: var(--border); overflow: hidden;
+    }
+    .tx-progress-fill {
+      height: 100%; width: 0%; border-radius: 3px;
+      background: var(--accent);
+      transition: width 0.4s ease-out, background-color 0.4s ease;
+    }
+    .tx-progress-fill.ok { background: var(--ok); }
+    .tx-progress-fill.warn { background: var(--warn); }
+    .tx-progress-fill.err { background: var(--err); }
+    /* Echo-wait phase: amber bar with diagonal moving stripes so the user can
+       see *something* is still happening even though chain confirmation can
+       take 30-60s and we have no incremental progress signal until the echo
+       lands. */
+    .tx-progress-fill.echoing {
+      background:
+        repeating-linear-gradient(
+          -45deg,
+          var(--warn) 0,
+          var(--warn) 8px,
+          rgba(255, 255, 255, 0.25) 8px,
+          rgba(255, 255, 255, 0.25) 16px
+        );
+      background-size: 22.6px 22.6px;
+      animation: echoStripes 1s linear infinite;
+    }
+    @keyframes echoStripes {
+      from { background-position: 0 0; }
+      to   { background-position: 22.6px 0; }
+    }
+    .tx-progress-label {
+      font-size: 12px; color: var(--muted); margin-top: 6px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .tx-progress-label.warn { color: var(--warn); }
+    .tx-progress-label.err { color: var(--err); }
+    .tx-progress-label .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; flex: 0 0 auto;
+      animation: echoPulse 1.4s ease-in-out infinite;
+    }
+
+    /* Result tile (most recent) */
+    .timing {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 16px;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .timing .label { color: var(--muted); font-size: 12px; }
+    .timing .val { font-weight: 600; }
+    .timing .val.muted { color: var(--muted); font-weight: 500; }
+    .timing-section {
+      margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border);
+    }
+    .status {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .status.pending  { background: var(--chip-bg); color: var(--accent); }
+    .status.echoing  { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
+    .status.confirmed { background: rgba(15, 118, 110, 0.15); color: var(--ok); }
+    .status.skipped  { background: var(--border); color: var(--muted); }
+    .status.failed   { background: rgba(200, 30, 30, 0.15); color: var(--err); }
+
+    @keyframes echoPulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.55; }
+    }
+    .status.echoing { animation: echoPulse 1.4s ease-in-out infinite; }
+    .live-timer { font-variant-numeric: tabular-nums; color: var(--warn); }
+    .live-timer::after {
+      content: "…";
+      display: inline-block;
+      animation: echoPulse 1.4s ease-in-out infinite;
+      margin-left: 1px;
+    }
+
+    /* History list */
+    .history-empty {
+      font-size: 13px; color: var(--muted); text-align: center; padding: 12px 0;
+    }
+    .history-row {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px;
+      padding: 10px 0;
+      border-top: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+    }
+    .history-row:first-child { border-top: 0; }
+    .history-row .left { font-size: 13px; }
+    .history-row .right { font-size: 12px; color: var(--muted); text-align: right; }
+    .history-row .amount { font-weight: 600; }
+
+    .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+    .footer-note {
+      text-align: center; font-size: 11px; color: var(--muted);
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
+    .footer-note .pubkey { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  </style>
+</head>
+<body>
+  <div class="topBar">
+    <div class="topBar-inner">
+      <div>
+        <h1>Echo</h1>
+        <div class="sub">Send N tokens, get N-1 back. Measures sidecar round-trip latency.</div>
+      </div>
+      <span class="modePill" id="modePill">…</span>
+    </div>
+  </div>
+
+  <div class="scrollArea">
+    <main>
+      <!-- Send form -->
+      <div class="card">
+        <h2>Send</h2>
+        <label for="amountInput">Amount (≥ 2)</label>
+        <div class="row">
+          <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
+          <button id="sendBtn" class="primary">Send</button>
+        </div>
+        <div class="tx-progress hide" id="txProgress">
+          <div class="tx-progress-track"><div class="tx-progress-fill"></div></div>
+          <div class="tx-progress-label">Sending...</div>
+        </div>
+        <div class="hint" id="errMsg" style="display:none"></div>
+      </div>
+
+      <!-- Most recent attempt -->
+      <div class="card" id="latestCard" style="display:none">
+        <h2>Latest attempt <span class="status" id="latestStatus">pending</span></h2>
+        <div class="timing">
+          <div class="label">You sent</div>
+          <div class="val" id="latestSentAmount">—</div>
+          <div class="label">Echo received</div>
+          <div class="val" id="latestEchoAmount">—</div>
+        </div>
+
+        <div class="timing-section">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Wall-clock latency (your phone)</div>
+          <div class="timing">
+            <div class="label">Send → confirmed</div>
+            <div class="val" id="latencySend">—</div>
+            <div class="label">Confirmed → echo seen</div>
+            <div class="val" id="latencyEcho">—</div>
+            <div class="label">Total round-trip</div>
+            <div class="val" id="latencyTotal">—</div>
+          </div>
+        </div>
+
+        <div class="timing-section" id="serverTimingSection" style="display:none">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Server-side breakdown</div>
+          <div class="timing">
+            <div class="label">Poll detect lag</div>
+            <div class="val muted" id="serverPollLag">—</div>
+            <div class="label">Echo build + RPC</div>
+            <div class="val muted" id="serverEchoQueue">—</div>
+            <div class="label">Chain round-trip</div>
+            <div class="val muted" id="serverChainRtt">—</div>
+          </div>
+        </div>
+
+        <div class="hint err" id="latestError" style="display:none"></div>
+      </div>
+
+      <!-- History -->
+      <div class="card">
+        <h2>Recent attempts</h2>
+        <div id="history"></div>
+      </div>
+
+      <!-- Info -->
+      <div class="card info">
+        <h2>How this works</h2>
+        <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the sidecar's <code>/wallet/send</code> RPC to return <code>N-1</code> tokens.</p>
+        <p>The wall-clock numbers above measure your phone's view of the round-trip; the server-side breakdown shows where the time is going (poll lag → RPC submit → chain confirmation).</p>
+      </div>
+
+      <div class="footer-note">
+        Echo address: <span class="pubkey" id="appPubkeyText">…</span>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    /* ── Config ───────────────────────────────────────────── */
+    const APP_ID = "echo";
+    const APP_PUBKEY =
+      window.localStorage.getItem("echo:app_pubkey") ||
+      "ut1rfa6arxcy84ysusvfg309ly6guk3kch9qvgktn32d88xk704u5tsges8uh";
+
+    const TX_SEND_OPTS = { timeoutMs: 90000, pollIntervalMs: 1500 };
+    const HISTORY_KEY = "echo:history:v1";
+    const HISTORY_MAX = 20;
+    const STATE_POLL_MS = 2000;
+    const EXPLORER_BASE = window.location.origin + "/explorer-api";
+
+    /* ── Standard helpers ─────────────────────────────────── */
+    function extractTxId(sendResult) {
+      if (!sendResult) return null;
+      const cands = [];
+      if (typeof sendResult === "string") cands.push(sendResult);
+      if (typeof sendResult === "object") {
+        cands.push(sendResult.txid, sendResult.txId, sendResult.hash, sendResult.tx_hash, sendResult.txHash, sendResult.id);
+        if (sendResult.tx && typeof sendResult.tx === "object") {
+          cands.push(sendResult.tx.id, sendResult.tx.txid, sendResult.tx.hash, sendResult.tx.tx_id);
+        }
+      }
+      for (const c of cands) if (typeof c === "string" && c) return c;
+      return null;
+    }
+
+    function fmtMs(ms) {
+      if (ms == null || !Number.isFinite(ms)) return "—";
+      if (ms < 0) ms = 0;
+      if (ms < 1000) return Math.round(ms) + " ms";
+      return (ms / 1000).toFixed(2) + " s";
+    }
+
+    function shortPk(pk) {
+      if (!pk) return "—";
+      return pk.slice(0, 8) + "…" + pk.slice(-4);
+    }
+
+    /* ── DOM refs ─────────────────────────────────────────── */
+    const amountInput = document.getElementById("amountInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const errMsg = document.getElementById("errMsg");
+    const modePill = document.getElementById("modePill");
+    const appPubkeyText = document.getElementById("appPubkeyText");
+
+    const latestCard = document.getElementById("latestCard");
+    const latestStatus = document.getElementById("latestStatus");
+    const latestSentAmount = document.getElementById("latestSentAmount");
+    const latestEchoAmount = document.getElementById("latestEchoAmount");
+    const latencySend = document.getElementById("latencySend");
+    const latencyEcho = document.getElementById("latencyEcho");
+    const latencyTotal = document.getElementById("latencyTotal");
+    const serverTimingSection = document.getElementById("serverTimingSection");
+    const serverPollLag = document.getElementById("serverPollLag");
+    const serverEchoQueue = document.getElementById("serverEchoQueue");
+    const serverChainRtt = document.getElementById("serverChainRtt");
+    const latestError = document.getElementById("latestError");
+    const historyEl = document.getElementById("history");
+
+    appPubkeyText.textContent = shortPk(APP_PUBKEY);
+
+    /* ── State ────────────────────────────────────────────── */
+    let sending = false;
+    let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
+    let pendingByTxId = new Map(); // requestTxId -> history entry
+
+    function loadHistory() {
+      try {
+        const raw = window.localStorage.getItem(HISTORY_KEY);
+        if (raw) history = JSON.parse(raw);
+        if (!Array.isArray(history)) history = [];
+      } catch (_) { history = []; }
+      // Re-attach in-flight items
+      for (const h of history) {
+        if (h.requestTxId && (h.status === "pending" || h.status === "echoing")) {
+          pendingByTxId.set(h.requestTxId, h);
+        }
+      }
+    }
+
+    function persistHistory() {
+      try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_MAX))); } catch (_) {}
+    }
+
+    /* ── Progress bar ─────────────────────────────────────────
+       The bar covers the *full* round-trip in two phases:
+
+         phase "sending":  user-tx submit → on-chain confirmation
+                           (blue, eased ramp 0% → ~95% over ~30s)
+         phase "echoing":  confirmation → echo-tx seen by server
+                           (amber striped bar pinned at 95% with a
+                            live "Waiting for echo… 12.3s" label)
+         phase "done":     green 100% bar with total round-trip,
+                           auto-hides after a moment
+
+       This matters because chain confirmation is ~30-60s; without a
+       persistent visual after the user's tx confirms, the UI looks
+       frozen even though the echo round-trip is the longest part. */
+    const TX_PB_EXPECTED_S = 30, TX_PB_WARN_S = 45, TX_PB_ERR_S = 90;
+    let _pbRaf = null;
+    let _pbPhase = "idle"; // "idle" | "sending" | "echoing" | "done"
+    let _pbSendStart = 0;
+    let _pbEchoStart = 0;
+    let _pbHideTimer = null;
+    // The requestTxId the bar is currently tracking. Lets us ignore late
+    // server-state updates for stale entries when the user has already
+    // started a new send.
+    let _pbTrackingTxId = null;
+
+    function pbSendPercent(s) {
+      if (s <= TX_PB_EXPECTED_S) {
+        const t = s / TX_PB_EXPECTED_S;
+        return 95 * (1 - Math.pow(1 - t, 3));
+      }
+      return 95 + 5 * (1 - Math.exp(-(s - TX_PB_EXPECTED_S) / 120));
+    }
+
+    function pbEl() { return document.getElementById("txProgress"); }
+    function pbFill() { const e = pbEl(); return e && e.querySelector(".tx-progress-fill"); }
+    function pbLabel() { const e = pbEl(); return e && e.querySelector(".tx-progress-label"); }
+
+    // Cached label state so we never thrash the DOM on every frame. Without
+    // this, calling pbSetLabel inside a 60fps tick destroys + rebuilds the
+    // pulsing dot element each frame, which (a) prevents the CSS animation
+    // from running and (b) caused the fill-bar transition to stop visibly
+    // updating because the constant child-removal in the flex label kept
+    // invalidating layout faster than the browser could paint.
+    const _pbLabel = { text: null, className: null, withDot: null, textNode: null };
+
+    function pbSetLabel(text, className, withDot) {
+      const label = pbLabel();
+      if (!label) return;
+      const structureChanged = _pbLabel.withDot !== withDot;
+      if (_pbLabel.className !== className) {
+        label.className = className;
+        _pbLabel.className = className;
+      }
+      if (structureChanged) {
+        label.textContent = "";
+        if (withDot) {
+          const dot = document.createElement("span");
+          dot.className = "dot";
+          label.appendChild(dot);
+        }
+        const textNode = document.createTextNode(text);
+        label.appendChild(textNode);
+        _pbLabel.withDot = withDot;
+        _pbLabel.text = text;
+        _pbLabel.textNode = textNode;
+        return;
+      }
+      if (_pbLabel.text !== text) {
+        if (_pbLabel.textNode) _pbLabel.textNode.nodeValue = text;
+        else { label.appendChild(document.createTextNode(text)); }
+        _pbLabel.text = text;
+      }
+    }
+
+    function pbResetLabelCache() {
+      _pbLabel.text = null;
+      _pbLabel.className = null;
+      _pbLabel.withDot = null;
+      _pbLabel.textNode = null;
+    }
+
+    function pbCancelHide() {
+      if (_pbHideTimer != null) { clearTimeout(_pbHideTimer); _pbHideTimer = null; }
+    }
+
+    /* Tick at ~8 Hz. The CSS `transition: width 0.4s ease-out` smooths
+       between samples, so 120ms is plenty smooth visually and ~8× less
+       layout work than rAF. */
+    const PB_TICK_MS = 120;
+
+    function startProgressBar() {
+      pbCancelHide();
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "sending";
+      const el = pbEl();
+      if (el) el.classList.remove("hide");
+      const fill = pbFill();
+      if (fill) {
+        fill.className = "tx-progress-fill";
+        // Force a reflow before setting width so the 0% baseline is
+        // committed; otherwise the first transition target may be
+        // batched away and the bar appears to "jump" instead of grow.
+        // eslint-disable-next-line no-unused-expressions
+        fill.offsetHeight;
+        fill.style.width = "0%";
+      }
+      pbSetLabel("Sending…", "tx-progress-label", true);
+      _pbSendStart = performance.now();
+      const tick = () => {
+        if (_pbPhase !== "sending") return;
+        const s = (performance.now() - _pbSendStart) / 1000;
+        const f = pbFill();
+        if (f) {
+          const newClass = "tx-progress-fill" +
+            (s >= TX_PB_ERR_S ? " err" : s >= TX_PB_WARN_S ? " warn" : "");
+          if (f.className !== newClass) f.className = newClass;
+          f.style.width = pbSendPercent(s) + "%";
+        }
+        if (s >= TX_PB_ERR_S)      pbSetLabel("Taking longer than it should", "tx-progress-label err", false);
+        else if (s >= TX_PB_WARN_S) pbSetLabel("Taking longer than expected", "tx-progress-label warn", true);
+        else                         pbSetLabel("Sending…", "tx-progress-label", true);
+        _pbRaf = setTimeout(tick, PB_TICK_MS);
+      };
+      // First sample after one tick interval — the CSS transition kicks in
+      // animating from 0% to that width, so the user sees an immediate
+      // visible movement instead of waiting a frame.
+      _pbRaf = setTimeout(tick, PB_TICK_MS);
+    }
+
+    /* Transition from the "user tx confirmed" milestone into the
+       "waiting for echo" phase. Bar stays visible, button stays
+       enabled — the user can queue more sends if they want. */
+    function startEchoPhaseProgressBar(trackingTxId) {
+      pbCancelHide();
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "echoing";
+      _pbTrackingTxId = trackingTxId || null;
+      const el = pbEl();
+      if (el) el.classList.remove("hide");
+      const fill = pbFill();
+      if (fill) {
+        fill.className = "tx-progress-fill echoing";
+        fill.style.width = "95%";
+      }
+      _pbEchoStart = performance.now();
+      const tick = () => {
+        if (_pbPhase !== "echoing") return;
+        const s = (performance.now() - _pbEchoStart) / 1000;
+        const text = "Waiting for echo… " + (s < 10 ? s.toFixed(1) : Math.round(s)) + "s";
+        pbSetLabel(text, "tx-progress-label warn", true);
+        _pbRaf = setTimeout(tick, PB_TICK_MS);
+      };
+      tick();
+    }
+
+    /* Echo arrived — show green completion + total round-trip, then hide. */
+    function completeEchoPhaseProgressBar(totalRoundTripMs) {
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "done";
+      _pbTrackingTxId = null;
+      const el = pbEl();
+      if (!el) return;
+      const fill = pbFill();
+      if (fill) { fill.className = "tx-progress-fill ok"; fill.style.width = "100%"; }
+      const txt = totalRoundTripMs != null
+        ? "Echo received! Round trip " + (totalRoundTripMs / 1000).toFixed(2) + "s"
+        : "Echo received!";
+      pbSetLabel(txt, "tx-progress-label", false);
+      pbCancelHide();
+      _pbHideTimer = setTimeout(() => {
+        if (_pbPhase === "done") el.classList.add("hide");
+      }, 3500);
+    }
+
+    function failProgressBar(message) {
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "done";
+      _pbTrackingTxId = null;
+      const el = pbEl();
+      if (!el) return;
+      const fill = pbFill();
+      if (fill) { fill.className = "tx-progress-fill err"; fill.style.width = "100%"; }
+      pbSetLabel(message || "Echo failed", "tx-progress-label err", false);
+      pbCancelHide();
+      _pbHideTimer = setTimeout(() => {
+        if (_pbPhase === "done") el.classList.add("hide");
+      }, 4000);
+    }
+
+    function stopProgressTick() {
+      if (_pbRaf) { clearTimeout(_pbRaf); _pbRaf = null; }
+    }
+
+    function hideProgressBarNow() {
+      stopProgressTick();
+      pbCancelHide();
+      pbResetLabelCache();
+      _pbPhase = "idle";
+      _pbTrackingTxId = null;
+      const el = pbEl();
+      if (el) el.classList.add("hide");
+    }
+
+    function setSending(v, ok) {
+      sending = !!v;
+      amountInput.disabled = !!v;
+      sendBtn.disabled = !!v;
+      if (v) {
+        // Starting a fresh send always resets the bar — even if a previous
+        // echo is still pending. The previous entry's eventual confirmation
+        // will be ignored by the bar (tracking-id mismatch) but is still
+        // recorded in history.
+        startProgressBar();
+      } else if (!ok) {
+        hideProgressBarNow();
+      }
+      // If ok=true the bar stays in the "sending" phase; the click handler
+      // will transition it to the "echoing" phase once it has a requestTxId
+      // to track. (We can't transition here because we don't have the id yet.)
+    }
+
+    function showError(msg) {
+      errMsg.textContent = msg;
+      errMsg.style.display = "block";
+      errMsg.classList.add("err");
+    }
+    function clearError() { errMsg.style.display = "none"; }
+
+    /* ── Send flow ────────────────────────────────────────── */
+    sendBtn.addEventListener("click", async () => {
+      if (sending) return;
+      clearError();
+
+      const amount = parseInt(amountInput.value, 10);
+      if (!Number.isFinite(amount) || amount < 2) {
+        showError("Amount must be a number ≥ 2 (echo returns N-1).");
+        return;
+      }
+
+      const memo = JSON.stringify({ app: APP_ID, type: "send" });
+      const sentAtMs = performance.now();
+      const sentAtWall = Date.now();
+
+      setSending(true);
+      let result = null;
+      try {
+        result = await window.sendTransaction(APP_PUBKEY, amount, memo, {
+          ...TX_SEND_OPTS,
+          confirmTitle: "Echo test",
+          confirmSubtitle: `Send ${amount} tokens; ${amount - 1} will return.`,
+        });
+        setSending(false, true);
+      } catch (e) {
+        setSending(false, false);
+        showError("Send failed: " + (e && e.message ? e.message : String(e)));
+        return;
+      }
+
+      const confirmedAtMs = performance.now();
+      const requestTxId = extractTxId(result);
+      const entry = {
+        requestTxId: requestTxId || ("local-" + Date.now()),
+        sentAmount: amount,
+        expectedEcho: Math.max(1, amount - 1),
+        sentAtWall,
+        sentLatencyMs: confirmedAtMs - sentAtMs,
+        echoLatencyMs: null,
+        totalLatencyMs: null,
+        status: requestTxId ? "echoing" : "pending",
+        echoAmount: null,
+        error: null,
+        server: null,
+        confirmedAtWall: Date.now(),
+        _confirmedAtPerf: confirmedAtMs,
+      };
+
+      history.unshift(entry);
+      if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
+      if (requestTxId) pendingByTxId.set(requestTxId, entry);
+      persistHistory();
+      renderLatest(entry);
+      renderHistory();
+
+      // Transition the progress bar from "sending" → "waiting for echo".
+      // The bar stays visible with a striped amber fill and a live elapsed
+      // counter until pollServerState() sees the echo land.
+      if (entry.status === "echoing") startEchoPhaseProgressBar(entry.requestTxId);
+      else hideProgressBarNow();
+    });
+
+    /* ── Render ───────────────────────────────────────────── */
+    function renderLatest(entry) {
+      if (!entry) return;
+      latestCard.style.display = "block";
+      latestStatus.className = "status " + entry.status;
+      latestStatus.textContent = entry.status;
+      latestSentAmount.textContent = entry.sentAmount + " tokens";
+      latestEchoAmount.textContent = entry.echoAmount != null
+        ? entry.echoAmount + " tokens"
+        : "(expected " + entry.expectedEcho + ")";
+
+      latencySend.textContent = fmtMs(entry.sentLatencyMs);
+      latencyEcho.textContent = fmtMs(entry.echoLatencyMs);
+      latencyEcho.className = "val";
+      latencyTotal.textContent = fmtMs(
+        entry.sentLatencyMs != null && entry.echoLatencyMs != null
+          ? entry.sentLatencyMs + entry.echoLatencyMs
+          : null
+      );
+      latencyTotal.className = "val";
+
+      if (entry.server) {
+        serverTimingSection.style.display = "block";
+        serverPollLag.textContent = fmtMs(entry.server.pollLagMs);
+        serverEchoQueue.textContent = fmtMs(entry.server.echoQueueMs);
+        serverChainRtt.textContent = fmtMs(entry.server.chainRttMs);
+      } else {
+        serverTimingSection.style.display = "none";
+      }
+
+      if (entry.error) {
+        latestError.style.display = "block";
+        latestError.textContent = entry.error;
+      } else {
+        latestError.style.display = "none";
+      }
+
+      // Run the live timer only while the *top* entry is still echoing.
+      if (entry === history[0] && entry.status === "echoing") startEchoTicker();
+      else stopEchoTicker();
+    }
+
+    /* ── Live "waiting for echo" timer ────────────────────── */
+    let _echoTickerRaf = null;
+
+    function getEchoElapsedMs(entry) {
+      if (entry._confirmedAtPerf != null) return performance.now() - entry._confirmedAtPerf;
+      if (entry.confirmedAtWall != null) return Date.now() - entry.confirmedAtWall;
+      return null;
+    }
+
+    function tickEchoTimer() {
+      const top = history[0];
+      if (!top || top.status !== "echoing") {
+        _echoTickerRaf = null;
+        return;
+      }
+      const elapsed = getEchoElapsedMs(top);
+      if (elapsed != null) {
+        latencyEcho.textContent = fmtMs(elapsed);
+        latencyEcho.className = "val live-timer";
+        if (top.sentLatencyMs != null) {
+          latencyTotal.textContent = fmtMs(top.sentLatencyMs + elapsed);
+          latencyTotal.className = "val live-timer";
+        }
+      }
+      _echoTickerRaf = requestAnimationFrame(tickEchoTimer);
+    }
+
+    function startEchoTicker() {
+      if (_echoTickerRaf != null) return;
+      _echoTickerRaf = requestAnimationFrame(tickEchoTimer);
+    }
+
+    function stopEchoTicker() {
+      if (_echoTickerRaf != null) {
+        cancelAnimationFrame(_echoTickerRaf);
+        _echoTickerRaf = null;
+      }
+    }
+
+    function renderHistory() {
+      historyEl.innerHTML = "";
+      if (history.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "No attempts yet — send to begin.";
+        historyEl.appendChild(empty);
+        return;
+      }
+      for (const h of history) {
+        const row = document.createElement("div");
+        row.className = "history-row";
+
+        const left = document.createElement("div");
+        left.className = "left";
+        const amt = document.createElement("span");
+        amt.className = "amount";
+        amt.textContent = h.sentAmount + " → " + (h.echoAmount != null ? h.echoAmount : "?");
+        const status = document.createElement("span");
+        status.className = "status " + h.status;
+        status.textContent = h.status;
+        status.style.marginLeft = "8px";
+        left.appendChild(amt);
+        left.appendChild(status);
+
+        const right = document.createElement("div");
+        right.className = "right";
+        const total = (h.sentLatencyMs != null && h.echoLatencyMs != null)
+          ? fmtMs(h.sentLatencyMs + h.echoLatencyMs)
+          : (h.status === "skipped" || h.status === "failed" ? "—" : "…");
+        right.textContent = total;
+
+        row.appendChild(left);
+        row.appendChild(right);
+        historyEl.appendChild(row);
+      }
+    }
+
+    /* ── Platform token (social-vibecoding iframe) ─────────────
+       The platform shell mounts this dapp inside an iframe and adds a
+       signed JWT as ?token=... on the initial load. We:
+         1. Decode the payload (no signature check — that's the server's
+            job) so we can read the user's `usernode_pubkey` claim and
+            tell the bridge what address to use for getNodeAddress().
+         2. Forward the token verbatim on subsequent fetches via the
+            x-usernode-token header, matching the platform's auth
+            convention. /__echo/state is currently a public GET so the
+            header is harmless if absent, but if we ever move it under
+            /api/* the same code keeps working. */
+    const PLATFORM_TOKEN = (() => {
+      try { return new URLSearchParams(window.location.search).get("token") || ""; }
+      catch (_) { return ""; }
+    })();
+
+    function decodeJwtPayload(token) {
+      if (!token) return null;
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      try {
+        const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+        const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+        return JSON.parse(atob(padded));
+      } catch (_) { return null; }
+    }
+
+    function authHeaders(extra) {
+      const h = extra ? { ...extra } : {};
+      if (PLATFORM_TOKEN) h["x-usernode-token"] = PLATFORM_TOKEN;
+      return h;
+    }
+
+    /* ── Server state polling ─────────────────────────────── */
+    async function pollServerState() {
+      if (pendingByTxId.size === 0) return;
+      let resp;
+      try {
+        const r = await fetch("/__echo/state", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        resp = await r.json();
+      } catch (_) { return; }
+      if (!resp || !Array.isArray(resp.events)) return;
+
+      const byId = new Map();
+      for (const ev of resp.events) byId.set(ev.requestTxId, ev);
+
+      let dirty = false;
+      let latestUpdated = null;
+      // Outcomes that should update the progress bar — but only if it's
+      // still tracking the same requestTxId (user might have queued a new
+      // send already, in which case the bar is owned by that newer attempt).
+      let pbOutcome = null; // { kind: "ok" | "fail", txId, totalMs?, message? }
+
+      for (const [txId, entry] of pendingByTxId) {
+        const ev = byId.get(txId);
+        if (!ev) continue;
+
+        if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
+
+        if (ev.status === "skipped") {
+          entry.status = "skipped";
+          entry.error = ev.error || "Skipped by server";
+          pendingByTxId.delete(txId);
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+          pbOutcome = { kind: "fail", txId, message: "Skipped: " + entry.error };
+          continue;
+        }
+        if (ev.status === "failed") {
+          entry.status = "failed";
+          entry.error = ev.error || "Echo send failed";
+          pendingByTxId.delete(txId);
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+          pbOutcome = { kind: "fail", txId, message: "Echo failed: " + entry.error };
+          continue;
+        }
+
+        if (ev.echoConfirmedAtServerMs != null) {
+          if (entry.echoLatencyMs == null) {
+            entry.echoLatencyMs = performance.now() - entry._confirmedAtPerf;
+            entry.totalLatencyMs = entry.sentLatencyMs + entry.echoLatencyMs;
+          }
+          entry.status = "confirmed";
+          entry.server = {
+            pollLagMs: (ev.requestSeenAtServerMs != null && ev.requestTs != null)
+              ? ev.requestSeenAtServerMs - ev.requestTs : null,
+            echoQueueMs: (ev.echoSentAtServerMs != null && ev.requestSeenAtServerMs != null)
+              ? ev.echoSentAtServerMs - ev.requestSeenAtServerMs : null,
+            chainRttMs: (ev.echoConfirmedTs != null && ev.requestTs != null)
+              ? ev.echoConfirmedTs - ev.requestTs : null,
+          };
+          pendingByTxId.delete(txId);
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+          pbOutcome = { kind: "ok", txId, totalMs: entry.totalLatencyMs };
+        } else if (ev.status === "echoing" && entry.status !== "echoing") {
+          entry.status = "echoing";
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+        }
+      }
+
+      if (dirty) {
+        persistHistory();
+        if (latestUpdated) renderLatest(latestUpdated);
+        renderHistory();
+      }
+
+      // Update the progress bar only if it's still tracking the txId that
+      // just settled. After a fresh send, _pbTrackingTxId points at the
+      // newer attempt, so older confirmations harmlessly fall through here.
+      if (pbOutcome && pbOutcome.txId === _pbTrackingTxId) {
+        if (pbOutcome.kind === "ok") completeEchoPhaseProgressBar(pbOutcome.totalMs);
+        else failProgressBar(pbOutcome.message);
+      }
+    }
+
+    /* ── Init ─────────────────────────────────────────────── */
+    (async function init() {
+      loadHistory();
+      renderHistory();
+      if (history[0]) renderLatest(history[0]);
+
+      // If we were reloaded mid-echo, restore the progress bar so the user
+      // gets the same persistent visual instead of looking at a frozen UI.
+      const top = history[0];
+      if (top && top.status === "echoing" && top.confirmedAtWall != null) {
+        const elapsedMs = Date.now() - top.confirmedAtWall;
+        startEchoPhaseProgressBar(top.requestTxId);
+        // Backdate the phase start so the displayed counter reflects the
+        // real wall-clock wait, not just time-since-reload.
+        _pbEchoStart = performance.now() - elapsedMs;
+      }
+
+      // If we're running inside the social-vibecoding iframe, the JWT
+      // carries the user's wallet address (usernode_pubkey claim). Hand it
+      // to the bridge so getNodeAddress() / the QR overlay's polling all
+      // see the right pubkey. Outside that path the claim is absent and
+      // the bridge falls back to native (mobile) or mock mode.
+      const claims = decodeJwtPayload(PLATFORM_TOKEN);
+      if (claims && claims.usernode_pubkey && window.usernode &&
+          typeof window.usernode.configure === "function") {
+        try { window.usernode.configure({ address: claims.usernode_pubkey }); } catch (_) {}
+      }
+
+      // Mode pill (mock vs chain) + configure transactionsBaseUrl for the bridge.
+      // The bridge's sendTransaction polls /transactions for inclusion after submit;
+      // in live-chain mode that requires window.usernode.transactionsBaseUrl to be set.
+      let isMock = false;
+      try {
+        isMock = window.usernode &&
+          typeof window.usernode.isMockEnabled === "function"
+          ? await window.usernode.isMockEnabled()
+          : false;
+      } catch (_) { isMock = false; }
+      modePill.textContent = isMock ? "mock mode" : "live chain";
+
+      if (!isMock) {
+        try {
+          const resp = await fetch(EXPLORER_BASE + "/active_chain");
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data && data.chain_id) {
+              window.usernode = window.usernode || {};
+              window.usernode.transactionsBaseUrl = EXPLORER_BASE + "/" + data.chain_id;
+            }
+          }
+        } catch (_) {}
+      }
+
+      setInterval(pollServerState, STATE_POLL_MS);
+      pollServerState();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "usernode-echo-dapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Echo — Usernode latency-test dapp (send N tokens, get N-1 back)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --local-dev"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
