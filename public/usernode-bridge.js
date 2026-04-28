@@ -37,18 +37,21 @@
   //
   // Detection:
   //   * If we have direct access to `window.Usernode` → use it (top frame).
-  //   * Else if we're inside an iframe → assume the parent runs this same
-  //     bridge and relay through `window.parent.postMessage`. If the parent
-  //     does not have a relay listener (e.g. embedded outside the platform
-  //     in a regular browser tab), calls will time out via the existing
-  //     pending-promise machinery — same outcome as before this patch.
+  //   * Else if we're inside an iframe → ask the parent via a `discover`
+  //     postMessage whether it has a native channel. The parent only ACKs
+  //     when it actually does, at which point we flip into relay mode.
+  //     Without an ACK we stay in regular non-native mode, so a dapp
+  //     embedded in a plain desktop browser still falls through to the
+  //     existing QR-code flow.
   var _hasNativeChannel =
     !!window.Usernode && typeof window.Usernode.postMessage === "function";
   var _inIframe = false;
   try { _inIframe = window !== window.parent; } catch (_) { _inIframe = false; }
-  var _useIframeRelay = !_hasNativeChannel && _inIframe;
 
-  window.usernode.isNative = _hasNativeChannel || _useIframeRelay;
+  // Optimistic: only true once the parent has positively confirmed it has a
+  // native channel for us to relay through.
+  var _useIframeRelay = false;
+  window.usernode.isNative = _hasNativeChannel;
 
   // ── Configuration for QR/desktop mode ─────────────────────────────────
   // Apps call window.usernode.configure({ address: "ut1..." }) to set the
@@ -98,36 +101,65 @@
     });
   }
 
-  // ── Iframe-relay client: receive responses from the parent ────────────
-  // The parent forwards Flutter's reply as
+  // ── Iframe-relay client: discover parent + receive responses ──────────
+  //
+  // When loaded inside a cross-origin iframe, kick off a `discover`
+  // handshake with the parent. The parent's bridge replies with
+  // `discover-ack` only if it has access to `window.Usernode`. On ack we
+  // flip `_useIframeRelay = true` and update `window.usernode.isNative`
+  // so subsequent dispatchers (`sendTransaction`, `signMessage`, etc.)
+  // route through the relay. With no ack we leave native off and the
+  // dapp falls through to its regular QR / mock paths.
+  //
+  // The same listener also funnels relayed responses
   //   { __usernode_relay: "response", id, value, error }
-  // Funnel into the existing `__usernodeResolve` plumbing so the rest of
-  // the bridge does not need to know about the relay path.
-  if (_useIframeRelay) {
+  // into the existing `__usernodeResolve` plumbing so the rest of the
+  // bridge does not need to know about the relay path.
+  if (_inIframe && !_hasNativeChannel) {
     window.addEventListener("message", function (e) {
-      var data = e.data;
-      if (!data || data.__usernode_relay !== "response") return;
-      // Only accept responses from our parent frame.
       if (e.source !== window.parent) return;
-      window.__usernodeResolve(data.id, data.value, data.error);
+      var data = e.data;
+      if (!data) return;
+      if (data.__usernode_relay === "discover-ack") {
+        if (!_useIframeRelay) {
+          _useIframeRelay = true;
+          window.usernode.isNative = true;
+        }
+        return;
+      }
+      if (data.__usernode_relay === "response") {
+        window.__usernodeResolve(data.id, data.value, data.error);
+      }
     });
+    try {
+      window.parent.postMessage({ __usernode_relay: "discover" }, "*");
+    } catch (_) { /* parent unreachable, stay non-native */ }
   }
 
   // ── Iframe-relay server: forward child-iframe requests to native ──────
+  //
   // When this bridge runs in the top frame and the native channel is
-  // available, listen for relay requests from embedded dapps (cross-origin
-  // iframes) and pass them straight through to the Flutter JS channel.
-  // This deliberately bypasses the parent page's own dispatch wrappers
-  // (mock detection, QR fallback) — the iframe already runs its own copy
-  // of this bridge and is responsible for those decisions in its own
-  // origin. The parent only relays raw Usernode.postMessage payloads.
+  // available, respond to `discover` pings with a `discover-ack`, and
+  // forward `request` payloads straight through to the Flutter JS
+  // channel. This deliberately bypasses the parent page's own dispatch
+  // wrappers (mock detection, QR fallback) — the iframe already runs
+  // its own copy of this bridge and is responsible for those decisions
+  // in its own origin. The parent only relays raw Usernode.postMessage
+  // payloads, which keeps cross-origin behaviour predictable.
   if (_hasNativeChannel) {
     window.addEventListener("message", function (e) {
       var data = e.data;
-      if (!data || data.__usernode_relay !== "request" || !e.source) return;
-      var origId = data.id;
+      if (!data || !e.source) return;
       var origin = e.origin || "*";
       var source = e.source;
+      if (data.__usernode_relay === "discover") {
+        try {
+          source.postMessage({ __usernode_relay: "discover-ack" }, origin);
+        } catch (_) { /* iframe gone, ignore */ }
+        return;
+      }
+      if (data.__usernode_relay !== "request") return;
+      var origId = data.id;
       var nativeId = "relay-" + String(Date.now()) + "-" +
         Math.random().toString(16).slice(2);
       function reply(value, error) {
