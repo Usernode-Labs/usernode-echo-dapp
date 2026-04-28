@@ -23,6 +23,7 @@
 const http = require("http");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 
@@ -108,10 +109,63 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Build version ────────────────────────────────────────────────────────────
+// A short hash of every file in public/ — surfaced to the client three ways:
+//   1. As an X-App-Version response header (visible via curl / DevTools).
+//   2. Substituted into __BUILD_VERSION__ placeholders in index.html (we
+//      use it both for a visible "Build XXXXXXXX" footer label and as
+//      a ?v=… query string on the bridge <script src=…> tags so a stale
+//      WebView cache can't shadow a new bridge).
+//   3. As JSON at /__build (handy for scripted health checks).
+// Recomputed on every request in --local-dev so iterating without a server
+// restart still flips the version. In production the file set is fixed
+// once the server starts, so a single startup compute is enough.
+const PUBLIC_DIR = path.join(__dirname, "public");
+
+function computeBuildVersion() {
+  const hash = crypto.createHash("sha1");
+  let names;
+  try { names = fs.readdirSync(PUBLIC_DIR).sort(); } catch (_) { return "unknown"; }
+  for (const file of names) {
+    if (file.startsWith(".")) continue;
+    try {
+      const data = fs.readFileSync(path.join(PUBLIC_DIR, file));
+      hash.update(file).update(data);
+    } catch (_) {}
+  }
+  return hash.digest("hex").slice(0, 8);
+}
+
+const STARTUP_BUILD_VERSION = computeBuildVersion();
+function getBuildVersion() {
+  return LOCAL_DEV ? computeBuildVersion() : STARTUP_BUILD_VERSION;
+}
+console.log(`  Build version: ${STARTUP_BUILD_VERSION}`);
+
+// Lightweight build-info endpoint. Public on purpose — it's just a hash.
+app.get("/__build", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ version: getBuildVersion(), localDev: LOCAL_DEV });
+});
+
 // ── Static assets ────────────────────────────────────────────────────────────
 // usernode-bridge.js, usernode-usernames.js, and any future CSS/images.
 // These are always served — they're public infrastructure, not app data.
-app.use(express.static(path.join(__dirname, "public"), { index: false }));
+//
+// Cache strategy: `no-cache` (NOT `no-store`) means the browser MAY keep a
+// copy locally but MUST revalidate with the server every time before using
+// it. Combined with the ?v=BUILD_VERSION query strings injected into
+// index.html, this guarantees that any change to a bridge file produces a
+// new URL the browser hasn't seen, bypassing the cache entirely.
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  etag: true,
+  lastModified: true,
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "no-cache, must-revalidate");
+    res.setHeader("X-App-Version", getBuildVersion());
+  },
+}));
 
 // ── HTML shell ───────────────────────────────────────────────────────────────
 // Auth-gated when running in production. Matches the template.js pattern of
@@ -127,9 +181,37 @@ const LANDING_HTML = `<!doctype html><meta charset=utf-8><title>Open in Usernode
   </div>
 </body>`;
 
+// Render the index.html template with __BUILD_VERSION__ substituted. Cached
+// in production (file set is frozen) and re-rendered on each request in
+// --local-dev so edits show up without a server restart.
+let _indexHtmlCache = null;
+let _indexHtmlVersion = null;
+function renderIndexHtml() {
+  const version = getBuildVersion();
+  if (LOCAL_DEV || _indexHtmlCache == null || _indexHtmlVersion !== version) {
+    let raw;
+    try {
+      raw = fs.readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+    } catch (e) {
+      return `<!doctype html><pre>Failed to read index.html: ${e.message}</pre>`;
+    }
+    _indexHtmlCache = raw.split("__BUILD_VERSION__").join(version);
+    _indexHtmlVersion = version;
+  }
+  return _indexHtmlCache;
+}
+
 app.get("*", (req, res) => {
   if (!LOCAL_DEV && !req.user) return res.status(401).send(LANDING_HTML);
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  // HTML is the entry point. We never want a stale copy: it carries the
+  // ?v=BUILD_VERSION cache-busters for the bridge scripts, so an old
+  // cached HTML loading a new bridge (or vice-versa) is a real bug.
+  res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("X-App-Version", getBuildVersion());
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.send(renderIndexHtml());
 });
 
 // ── Chain pollers (production only) ──────────────────────────────────────────

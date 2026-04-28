@@ -4,8 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
   <title>Echo — Usernode latency test</title>
-  <script src="/usernode-bridge.js"></script>
-  <script src="/usernode-usernames.js"></script>
+  <!-- ?v=__BUILD_VERSION__ is replaced by server.js with a hash of public/.
+       This guarantees a cache-stuck WebView can't shadow new bridge code:
+       a bridge edit produces a new URL the WebView has never seen. -->
+  <script src="/usernode-bridge.js?v=__BUILD_VERSION__"></script>
+  <script src="/usernode-usernames.js?v=__BUILD_VERSION__"></script>
+  <meta name="x-app-version" content="__BUILD_VERSION__" />
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     :root {
@@ -169,6 +173,7 @@
       display: inline-block; padding: 2px 8px; border-radius: 999px;
       font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     }
+    .status.sending  { background: var(--chip-bg); color: var(--accent); }
     .status.pending  { background: var(--chip-bg); color: var(--accent); }
     .status.echoing  { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
     .status.confirmed { background: rgba(15, 118, 110, 0.15); color: var(--ok); }
@@ -179,6 +184,7 @@
       0%, 100% { opacity: 1; }
       50%      { opacity: 0.55; }
     }
+    .status.sending,
     .status.echoing { animation: echoPulse 1.4s ease-in-out infinite; }
     .live-timer { font-variant-numeric: tabular-nums; color: var(--warn); }
     .live-timer::after {
@@ -294,6 +300,9 @@
 
       <div class="footer-note">
         Echo address: <span class="pubkey" id="appPubkeyText">…</span>
+        <span style="margin-left:8px;color:var(--muted);font-size:11px">
+          Build <span class="pubkey">__BUILD_VERSION__</span>
+        </span>
       </div>
     </main>
   </div>
@@ -306,7 +315,14 @@
       "ut1rfa6arxcy84ysusvfg309ly6guk3kch9qvgktn32d88xk704u5tsges8uh";
 
     const TX_SEND_OPTS = { timeoutMs: 90000, pollIntervalMs: 1500 };
-    const HISTORY_KEY = "echo:history:v1";
+    // Bump STORAGE_VERSION whenever the persisted history shape changes
+    // (or any other echo:* key's shape changes). loadHistory() purges
+    // older versions on startup so stale entries from previous deploys —
+    // most painfully, a stuck "echoing" entry whose server-side state is
+    // long gone — can't poison the new UI.
+    const STORAGE_VERSION = 2;
+    const HISTORY_KEY_PREFIX = "echo:history:v";
+    const HISTORY_KEY = HISTORY_KEY_PREFIX + STORAGE_VERSION;
     const HISTORY_MAX = 20;
     const STATE_POLL_MS = 2000;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
@@ -366,12 +382,41 @@
     let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
     let pendingByTxId = new Map(); // requestTxId -> history entry
 
+    function purgeOldHistoryVersions() {
+      try {
+        const stale = [];
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i);
+          if (k && k.startsWith(HISTORY_KEY_PREFIX) && k !== HISTORY_KEY) {
+            stale.push(k);
+          }
+        }
+        for (const k of stale) window.localStorage.removeItem(k);
+      } catch (_) {}
+    }
+
     function loadHistory() {
+      purgeOldHistoryVersions();
       try {
         const raw = window.localStorage.getItem(HISTORY_KEY);
         if (raw) history = JSON.parse(raw);
         if (!Array.isArray(history)) history = [];
       } catch (_) { history = []; }
+      // A "sending" entry persisted across a reload means we lost
+      // track of an in-flight tx (no requestTxId yet, can't poll).
+      // Mark it failed so the UI doesn't show a perpetually-spinning
+      // live timer for an attempt we can't recover.
+      let mutated = false;
+      for (const h of history) {
+        if (h.status === "sending") {
+          h.status = "failed";
+          h.error = h.error || "Page reloaded before send confirmed";
+          mutated = true;
+        }
+      }
+      if (mutated) {
+        try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_MAX))); } catch (_) {}
+      }
       // Re-attach in-flight items
       for (const h of history) {
         if (h.requestTxId && (h.status === "pending" || h.status === "echoing")) {
@@ -631,6 +676,34 @@
       const sentAtMs = performance.now();
       const sentAtWall = Date.now();
 
+      // Insert the entry up-front in "sending" status so the Latest
+      // Attempt card swaps to *this* attempt immediately and shows a
+      // live "Send → confirmed" timer ticking while we await chain
+      // inclusion. Without this, the previous attempt's results stay
+      // frozen on screen for ~30-60s while the new tx is in flight,
+      // which makes the UI look stuck.
+      const entry = {
+        requestTxId: null,
+        sentAmount: amount,
+        expectedEcho: Math.max(1, amount - 1),
+        sentAtWall,
+        _sentAtPerf: sentAtMs,
+        sentLatencyMs: null,
+        echoLatencyMs: null,
+        totalLatencyMs: null,
+        status: "sending",
+        echoAmount: null,
+        error: null,
+        server: null,
+        confirmedAtWall: null,
+        _confirmedAtPerf: null,
+      };
+      history.unshift(entry);
+      if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
+      persistHistory();
+      renderLatest(entry);
+      renderHistory();
+
       setSending(true);
       let result = null;
       try {
@@ -642,33 +715,25 @@
         setSending(false, true);
       } catch (e) {
         setSending(false, false);
-        showError("Send failed: " + (e && e.message ? e.message : String(e)));
+        entry.status = "failed";
+        entry.error = "Send failed: " + (e && e.message ? e.message : String(e));
+        persistHistory();
+        if (history[0] === entry) renderLatest(entry);
+        renderHistory();
+        showError(entry.error);
         return;
       }
 
       const confirmedAtMs = performance.now();
       const requestTxId = extractTxId(result);
-      const entry = {
-        requestTxId: requestTxId || ("local-" + Date.now()),
-        sentAmount: amount,
-        expectedEcho: Math.max(1, amount - 1),
-        sentAtWall,
-        sentLatencyMs: confirmedAtMs - sentAtMs,
-        echoLatencyMs: null,
-        totalLatencyMs: null,
-        status: requestTxId ? "echoing" : "pending",
-        echoAmount: null,
-        error: null,
-        server: null,
-        confirmedAtWall: Date.now(),
-        _confirmedAtPerf: confirmedAtMs,
-      };
-
-      history.unshift(entry);
-      if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
+      entry.requestTxId = requestTxId || ("local-" + Date.now());
+      entry.sentLatencyMs = confirmedAtMs - sentAtMs;
+      entry.confirmedAtWall = Date.now();
+      entry._confirmedAtPerf = confirmedAtMs;
+      entry.status = requestTxId ? "echoing" : "pending";
       if (requestTxId) pendingByTxId.set(requestTxId, entry);
       persistHistory();
-      renderLatest(entry);
+      if (history[0] === entry) renderLatest(entry);
       renderHistory();
 
       // Transition the progress bar from "sending" → "waiting for echo".
@@ -689,15 +754,42 @@
         ? entry.echoAmount + " tokens"
         : "(expected " + entry.expectedEcho + ")";
 
-      latencySend.textContent = fmtMs(entry.sentLatencyMs);
-      latencyEcho.textContent = fmtMs(entry.echoLatencyMs);
-      latencyEcho.className = "val";
-      latencyTotal.textContent = fmtMs(
-        entry.sentLatencyMs != null && entry.echoLatencyMs != null
-          ? entry.sentLatencyMs + entry.echoLatencyMs
-          : null
-      );
-      latencyTotal.className = "val";
+      // Three latency rows. Each is either:
+      //   • a final value (fmtMs of a recorded duration)
+      //   • a placeholder ("—")
+      //   • a live counter (.live-timer class, populated by tickLiveTimer)
+      // The ticker overwrites textContent on its own schedule, so here we
+      // only need to set the *initial* text and the className. We choose
+      // className based on which phase the entry is in.
+      if (entry.status === "sending") {
+        latencySend.className = "val live-timer";
+        latencySend.textContent = fmtMs(performance.now() - (entry._sentAtPerf || performance.now()));
+        latencyEcho.className = "val";
+        latencyEcho.textContent = "—";
+        latencyTotal.className = "val live-timer";
+        latencyTotal.textContent = latencySend.textContent;
+      } else {
+        latencySend.className = "val";
+        latencySend.textContent = fmtMs(entry.sentLatencyMs);
+        if (entry.status === "echoing") {
+          latencyEcho.className = "val live-timer";
+          // Initial text; ticker will overwrite immediately.
+          latencyEcho.textContent = fmtMs(getEchoElapsedMs(entry));
+          latencyTotal.className = "val live-timer";
+          latencyTotal.textContent = fmtMs(
+            (entry.sentLatencyMs || 0) + (getEchoElapsedMs(entry) || 0)
+          );
+        } else {
+          latencyEcho.className = "val";
+          latencyEcho.textContent = fmtMs(entry.echoLatencyMs);
+          latencyTotal.className = "val";
+          latencyTotal.textContent = fmtMs(
+            entry.sentLatencyMs != null && entry.echoLatencyMs != null
+              ? entry.sentLatencyMs + entry.echoLatencyMs
+              : null
+          );
+        }
+      }
 
       if (entry.server) {
         serverTimingSection.style.display = "block";
@@ -715,13 +807,31 @@
         latestError.style.display = "none";
       }
 
-      // Run the live timer only while the *top* entry is still echoing.
-      if (entry === history[0] && entry.status === "echoing") startEchoTicker();
-      else stopEchoTicker();
+      // Run the live timer for either in-flight phase ("sending" =
+      // awaiting chain inclusion, "echoing" = awaiting echo back).
+      // Anything else (confirmed/skipped/failed/pending) is final and
+      // doesn't need ticking.
+      if (entry === history[0] && (entry.status === "sending" || entry.status === "echoing")) {
+        startLiveTicker();
+      } else {
+        stopLiveTicker();
+      }
     }
 
-    /* ── Live "waiting for echo" timer ────────────────────── */
-    let _echoTickerRaf = null;
+    /* ── Live latency timer ───────────────────────────────────
+       Ticks the latency-row text for the top history entry while
+       it's in flight. Two phases share this single ticker:
+
+         "sending":  Send → confirmed counter is live. Echo row is
+                     "—". Total mirrors the Send counter (echo
+                     hasn't started yet).
+         "echoing":  Send → confirmed is fixed at its final value.
+                     Echo and Total are both live.
+
+       Phases auto-detect from `top.status`, so the click handler's
+       sending → echoing transition keeps this ticker running with
+       no restart needed. */
+    let _liveTickerRaf = null;
 
     function getEchoElapsedMs(entry) {
       if (entry._confirmedAtPerf != null) return performance.now() - entry._confirmedAtPerf;
@@ -729,33 +839,50 @@
       return null;
     }
 
-    function tickEchoTimer() {
+    function getSendElapsedMs(entry) {
+      if (entry._sentAtPerf != null) return performance.now() - entry._sentAtPerf;
+      if (entry.sentAtWall != null) return Date.now() - entry.sentAtWall;
+      return null;
+    }
+
+    function tickLiveTimer() {
       const top = history[0];
-      if (!top || top.status !== "echoing") {
-        _echoTickerRaf = null;
-        return;
-      }
-      const elapsed = getEchoElapsedMs(top);
-      if (elapsed != null) {
-        latencyEcho.textContent = fmtMs(elapsed);
-        latencyEcho.className = "val live-timer";
-        if (top.sentLatencyMs != null) {
-          latencyTotal.textContent = fmtMs(top.sentLatencyMs + elapsed);
+      if (!top) { _liveTickerRaf = null; return; }
+      if (top.status === "sending") {
+        const elapsed = getSendElapsedMs(top);
+        if (elapsed != null) {
+          const txt = fmtMs(elapsed);
+          latencySend.textContent = txt;
+          latencySend.className = "val live-timer";
+          latencyTotal.textContent = txt;
           latencyTotal.className = "val live-timer";
         }
+      } else if (top.status === "echoing") {
+        const elapsed = getEchoElapsedMs(top);
+        if (elapsed != null) {
+          latencyEcho.textContent = fmtMs(elapsed);
+          latencyEcho.className = "val live-timer";
+          if (top.sentLatencyMs != null) {
+            latencyTotal.textContent = fmtMs(top.sentLatencyMs + elapsed);
+            latencyTotal.className = "val live-timer";
+          }
+        }
+      } else {
+        _liveTickerRaf = null;
+        return;
       }
-      _echoTickerRaf = requestAnimationFrame(tickEchoTimer);
+      _liveTickerRaf = requestAnimationFrame(tickLiveTimer);
     }
 
-    function startEchoTicker() {
-      if (_echoTickerRaf != null) return;
-      _echoTickerRaf = requestAnimationFrame(tickEchoTimer);
+    function startLiveTicker() {
+      if (_liveTickerRaf != null) return;
+      _liveTickerRaf = requestAnimationFrame(tickLiveTimer);
     }
 
-    function stopEchoTicker() {
-      if (_echoTickerRaf != null) {
-        cancelAnimationFrame(_echoTickerRaf);
-        _echoTickerRaf = null;
+    function stopLiveTicker() {
+      if (_liveTickerRaf != null) {
+        cancelAnimationFrame(_liveTickerRaf);
+        _liveTickerRaf = null;
       }
     }
 
