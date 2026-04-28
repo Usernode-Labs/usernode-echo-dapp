@@ -60,9 +60,14 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 // Mirrors the social-vibecoding scaffold (see src/prompts/app-conventions.md):
 //   * GET non-/api requests pass through (HTML shell + static assets).
 //   * Non-GET and /api/* requests require a verified platform JWT.
+//   * /explorer-api/* is a transparent proxy to the public block explorer
+//     — gating it accomplishes nothing (anyone can hit the upstream
+//     directly) and breaks the bridge's POST /<chain_id>/transactions
+//     polling from inside the iframe (which has no token to forward).
 // In --local-dev we skip the gate entirely so the mock flow works without the
 // platform ever issuing a token.
 const PUBLIC_API_PATHS = new Set(["/health"]);
+const PUBLIC_PREFIXES = ["/explorer-api/"];
 app.use((req, res, next) => {
   if (LOCAL_DEV) return next();
   const token = req.query.token || req.headers["x-usernode-token"];
@@ -71,6 +76,7 @@ app.use((req, res, next) => {
   }
   if (req.method !== "GET" || req.path.startsWith("/api/")) {
     if (PUBLIC_API_PATHS.has(req.path)) return next();
+    if (PUBLIC_PREFIXES.some((p) => req.path.startsWith(p))) return next();
     if (!req.user) return res.status(401).json({ error: "Not authenticated" });
   }
   next();
