@@ -75,18 +75,42 @@
     else entry.resolve(value);
   };
 
+  // 15 s is well above the Flutter confirm-screen turnaround (single
+  // digits of ms in the relay leg + however long the user takes to
+  // approve), so a timeout firing means the parent never picked up the
+  // request — surface it as an actual error instead of an infinite hang.
+  var _RELAY_TIMEOUT_MS = 15000;
+
   function callNative(method, args) {
     var id = String(Date.now()) + "-" + Math.random().toString(16).slice(2);
     return new Promise(function (resolve, reject) {
       window.__usernodeBridge.pending[id] = { resolve: resolve, reject: reject };
       var payload = { method: method, id: id, args: args || {} };
       if (_useIframeRelay) {
+        var timer = setTimeout(function () {
+          var entry = window.__usernodeBridge.pending[id];
+          if (!entry) return;
+          delete window.__usernodeBridge.pending[id];
+          console.warn("[usernode-bridge] relay timeout for", method, "id", id);
+          reject(new Error(
+            "Usernode relay timed out (parent page never responded). " +
+            "Reload the host page so it picks up the latest bridge."
+          ));
+        }, _RELAY_TIMEOUT_MS);
+        // Wrap resolve/reject so the timeout is cleared on completion.
+        var origEntry = window.__usernodeBridge.pending[id];
+        window.__usernodeBridge.pending[id] = {
+          resolve: function (v) { clearTimeout(timer); origEntry.resolve(v); },
+          reject: function (e) { clearTimeout(timer); origEntry.reject(e); },
+        };
         try {
+          console.log("[usernode-bridge] relay → parent:", method, "id", id);
           window.parent.postMessage(
             { __usernode_relay: "request", id: id, method: method, args: args || {} },
             "*"
           );
         } catch (err) {
+          clearTimeout(timer);
           delete window.__usernodeBridge.pending[id];
           reject(err);
         }
@@ -122,16 +146,19 @@
       if (!data) return;
       if (data.__usernode_relay === "discover-ack") {
         if (!_useIframeRelay) {
+          console.log("[usernode-bridge] iframe relay activated (parent ack received)");
           _useIframeRelay = true;
           window.usernode.isNative = true;
         }
         return;
       }
       if (data.__usernode_relay === "response") {
+        console.log("[usernode-bridge] relay ← parent response id", data.id);
         window.__usernodeResolve(data.id, data.value, data.error);
       }
     });
     try {
+      console.log("[usernode-bridge] sending discover ping to parent");
       window.parent.postMessage({ __usernode_relay: "discover" }, "*");
     } catch (_) { /* parent unreachable, stay non-native */ }
   }
@@ -147,12 +174,14 @@
   // in its own origin. The parent only relays raw Usernode.postMessage
   // payloads, which keeps cross-origin behaviour predictable.
   if (_hasNativeChannel) {
+    console.log("[usernode-bridge] parent: native channel available, relay listener installed");
     window.addEventListener("message", function (e) {
       var data = e.data;
       if (!data || !e.source) return;
       var origin = e.origin || "*";
       var source = e.source;
       if (data.__usernode_relay === "discover") {
+        console.log("[usernode-bridge] parent ← discover from", origin, "→ acking");
         try {
           source.postMessage({ __usernode_relay: "discover-ack" }, origin);
         } catch (_) { /* iframe gone, ignore */ }
@@ -162,6 +191,11 @@
       var origId = data.id;
       var nativeId = "relay-" + String(Date.now()) + "-" +
         Math.random().toString(16).slice(2);
+      console.log(
+        "[usernode-bridge] parent ← relay request",
+        data.method,
+        "id", origId, "→ native id", nativeId
+      );
       function reply(value, error) {
         try {
           source.postMessage(
@@ -171,8 +205,14 @@
         } catch (_) { /* iframe gone, ignore */ }
       }
       window.__usernodeBridge.pending[nativeId] = {
-        resolve: function (v) { reply(v, null); },
-        reject: function (err) { reply(null, (err && err.message) || String(err)); },
+        resolve: function (v) {
+          console.log("[usernode-bridge] parent native resolve →", nativeId);
+          reply(v, null);
+        },
+        reject: function (err) {
+          console.log("[usernode-bridge] parent native reject →", nativeId, err);
+          reply(null, (err && err.message) || String(err));
+        },
       };
       try {
         window.Usernode.postMessage(JSON.stringify({
