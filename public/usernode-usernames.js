@@ -23,7 +23,23 @@
     window.localStorage.getItem("usernode:usernames_pubkey") ||
     "ut1p0p7y8ujacndc60r4a7pzk45dufdtarp6satvc0md7866633u8sqagm3az";
 
-  var TX_SEND_OPTS = { timeoutMs: 90000, pollIntervalMs: 1500 };
+  // Per-call override for the bridge's inclusion-poll transport. The host
+  // dapp page sets `window.usernode.serverCacheUrl` to its own appPubkey
+  // cache (e.g. "/__usernode/cache/<lastwinPubkey>"). Without this override
+  // the bridge would route the SSE waitForTx for our `set_username` send
+  // at that cache — which only stores txs whose recipient is the dapp's
+  // pubkey, not USERNAMES_PUBKEY. Result: the waiter never matches and
+  // the bridge times out at the 180s server-side cap, even though the
+  // tx confirmed on chain seconds after submission.
+  //
+  // Pointing at the usernames cache mount routes the waiter to the cache
+  // that actually receives this tx, so confirmations come back in
+  // sub-seconds via the usual node SSE → cache → /waitForTx path.
+  var TX_SEND_OPTS = {
+    timeoutMs: 180000,
+    pollIntervalMs: 1500,
+    serverCacheUrl: "/__usernode/cache/" + USERNAMES_PUBKEY,
+  };
   var CACHE_TTL_MS = 30000;
   var SERVER_CACHE_URL = "/__usernames/state";
 
