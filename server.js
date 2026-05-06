@@ -9,23 +9,26 @@
  *   - Client polls /__echo/state to render send/echo/total latencies
  *
  * Modes:
- *   node server.js              — production mode (auth-enforced, real chain)
- *   node server.js --local-dev  — local dev (no auth, mock transaction store)
+ *   node server.js              — production mode (real chain)
+ *   node server.js --local-dev  — local dev (mock transaction store)
+ *
+ * Auth model: echo is public. There is no JWT gate on the HTTP surface —
+ * any visitor can load the page and read /__echo/state. Transaction signing
+ * happens client-side via the bridge: native Usernode channel inside the
+ * Flutter WebView (top frame OR iframe-relay), QR fallback in a desktop
+ * browser. Echo's server never reads or relies on a platform identity.
  *
  * Env vars:
  *   PORT                — HTTP port (default 3000 — matches platform scaffold)
- *   JWT_SECRET          — shared with the social-vibecoding platform
  *   ECHO_APP_PUBKEY     — echo dapp address (required for chain mode)
  *   ECHO_APP_SECRET_KEY — secret key for outgoing /wallet/send (required for chain mode)
  *   NODE_RPC_URL        — sidecar URL (default http://usernode-node:3000 inside compose)
  */
 
-const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
-const jwt = require("jsonwebtoken");
 
 const {
   loadEnvFile,
@@ -48,7 +51,6 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 const ECHO_APP_PUBKEY = process.env.ECHO_APP_PUBKEY || "ut1_echo_default_pubkey";
 const ECHO_APP_SECRET_KEY = process.env.ECHO_APP_SECRET_KEY || "";
 const NODE_RPC_URL = process.env.NODE_RPC_URL || "http://usernode-node:3000";
-const JWT_SECRET = process.env.JWT_SECRET || "";
 
 // ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
@@ -56,34 +58,8 @@ const app = express();
 // One hop (Caddy) in front of us.
 app.set("trust proxy", 1);
 
-// Health check (always public — used by Docker healthcheck and platform polling).
+// Health check — used by Docker healthcheck and platform polling.
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
-
-// ── Auth middleware ──────────────────────────────────────────────────────────
-// Mirrors the social-vibecoding scaffold (see src/prompts/app-conventions.md):
-//   * GET non-/api requests pass through (HTML shell + static assets).
-//   * Non-GET and /api/* requests require a verified platform JWT.
-//   * /explorer-api/* is a transparent proxy to the public block explorer
-//     — gating it accomplishes nothing (anyone can hit the upstream
-//     directly) and breaks the bridge's POST /<chain_id>/transactions
-//     polling from inside the iframe (which has no token to forward).
-// In --local-dev we skip the gate entirely so the mock flow works without the
-// platform ever issuing a token.
-const PUBLIC_API_PATHS = new Set(["/health"]);
-const PUBLIC_PREFIXES = ["/explorer-api/"];
-app.use((req, res, next) => {
-  if (LOCAL_DEV) return next();
-  const token = req.query.token || req.headers["x-usernode-token"];
-  if (token && JWT_SECRET) {
-    try { req.user = jwt.verify(token, JWT_SECRET); } catch { /* fall through */ }
-  }
-  if (req.method !== "GET" || req.path.startsWith("/api/")) {
-    if (PUBLIC_API_PATHS.has(req.path)) return next();
-    if (PUBLIC_PREFIXES.some((p) => req.path.startsWith(p))) return next();
-    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
-  }
-  next();
-});
 
 // ── Mock API (only --local-dev) ──────────────────────────────────────────────
 const mockApi = createMockApi({ localDev: LOCAL_DEV });
@@ -220,8 +196,8 @@ app.get("/__build", (_req, res) => {
 //
 // Mounted after the build-version block because getBuildVersion's body
 // references STARTUP_BUILD_VERSION (a `const`, in TDZ until evaluated).
-// Mounted before static + the catch-all HTML shell so /status doesn't
-// fall through to the LANDING_HTML auth wall.
+// Mounted before the catch-all HTML shell so /status doesn't fall through
+// to the index.html renderer.
 const dappServerStatus = createDappServerStatus({
   name: "echo",
   nodeProbe: nodeStatusProbe,
@@ -258,18 +234,9 @@ app.use(express.static(PUBLIC_DIR, {
 }));
 
 // ── HTML shell ───────────────────────────────────────────────────────────────
-// Auth-gated when running in production. Matches the template.js pattern of
-// returning a small "Open in Usernode" landing page so direct visits don't
-// reveal the dapp UI before auth.
-const PLATFORM_DOMAIN = process.env.USERNODE_DOMAIN || "usernode.evanshapiro.dev";
-const LANDING_HTML = `<!doctype html><meta charset=utf-8><title>Open in Usernode</title>
-<body style="font-family:system-ui;background:#09090b;color:#e4e4e7;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
-  <div style="max-width:24rem;padding:2rem;text-align:center">
-    <h1 style="font-size:1.25rem;margin:0 0 0.5rem">Open this app inside Usernode</h1>
-    <p style="color:#a1a1aa;font-size:0.9rem;margin:0 0 1.25rem">This page is served via the platform; direct visits aren't authenticated.</p>
-    <a href="https://${PLATFORM_DOMAIN}" style="display:inline-block;padding:0.5rem 1rem;background:#7c3aed;color:white;border-radius:0.5rem;text-decoration:none;font-size:0.9rem">Go to Usernode</a>
-  </div>
-</body>`;
+// Public — anyone can load the page. Wallet operations are signed
+// client-side via the bridge (native channel inside the Flutter WebView,
+// QR fallback in a desktop browser).
 
 // Render the index.html template with __BUILD_VERSION__ substituted. Cached
 // in production (file set is frozen) and re-rendered on each request in
@@ -291,8 +258,7 @@ function renderIndexHtml() {
   return _indexHtmlCache;
 }
 
-app.get("*", (req, res) => {
-  if (!LOCAL_DEV && !req.user) return res.status(401).send(LANDING_HTML);
+app.get("*", (_req, res) => {
   // HTML is the entry point. We never want a stale copy: it carries the
   // ?v=BUILD_VERSION cache-busters for the bridge scripts, so an old
   // cached HTML loading a new bridge (or vice-versa) is a real bug.
@@ -309,6 +275,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`\nEcho server running at http://localhost:${PORT}`);
   console.log(`  App pubkey:    ${ECHO_APP_PUBKEY.slice(0, 24)}…`);
   console.log(`  Node RPC:      ${NODE_RPC_URL}`);
-  console.log(`  Mode:          ${LOCAL_DEV ? "LOCAL DEV (auth bypassed, mock API)" : "production (JWT enforced, chain pollers running)"}`);
+  console.log(`  Mode:          ${LOCAL_DEV ? "LOCAL DEV (mock API)" : "production (chain pollers running, public access)"}`);
   console.log(`  Echo signing:  ${ECHO_APP_SECRET_KEY ? "enabled" : "DISABLED (no ECHO_APP_SECRET_KEY)"}\n`);
 });

@@ -15,8 +15,9 @@ conventions win.
 
 ## Architecture
 
-- `server.js` — Express server. JWT auth middleware, mock API (--local-dev),
-  echo state endpoint, explorer proxy, static `public/`, dual chain pollers.
+- `server.js` — Express server. Mock API (--local-dev), echo state endpoint,
+  explorer proxy, static `public/`, dual chain pollers. No auth middleware
+  (echo is public — see "Auth model" below).
 - `echo-logic.js` — Core state machine: dedups incoming tx, calls the
   sidecar `/wallet/send`, watches outgoing tx for confirmation, exposes
   `/__echo/state`.
@@ -31,9 +32,36 @@ conventions win.
 
 ```bash
 npm install
-npm run dev          # mock mode, no auth, http://localhost:3000
+npm run dev          # mock mode, http://localhost:3000
 npm start            # production mode (requires .env)
 ```
+
+## Auth model
+
+Echo is **public**. There is no JWT, no platform login required, no
+`req.user` consulted anywhere. The `JWT_SECRET` env var is no longer used
+and `jsonwebtoken` is not a dependency. Wallet operations are signed
+client-side via `usernode-bridge.js`, which has three modes and picks one
+automatically:
+
+- **Native (top frame in Flutter WebView)** — the Usernode mobile app
+  injects a `Usernode` JS channel on every loaded page (see
+  `flutter-mobile-app/lib/features/dapps/dapp_webview_screen.dart`,
+  `addJavaScriptChannel('Usernode', …)` on the `WebViewController`). The
+  bridge detects this with `!!window.Usernode` and routes
+  `sendTransaction` / `signMessage` through the channel.
+- **Iframe-relay (echo embedded inside another page that has the native
+  channel — e.g. dapp-starter loaded inside the WebView)** — the bridge
+  posts a `discover` message to `window.parent`; if the parent ACKs, the
+  child flips into relay mode and round-trips its native calls through
+  the parent's `Usernode.postMessage`.
+- **QR fallback (desktop browser, no native channel anywhere in the
+  frame stack)** — `sendTransaction` shows a QR code for the user to
+  scan with the Usernode mobile app, then polls for inclusion.
+
+This means the share URL `https://echo.<USERNODE_DOMAIN>` works the same
+for anyone who opens it: they get the app, and tx signing routes through
+whichever transport their environment supports.
 
 ## Memo schema
 
