@@ -130,7 +130,26 @@ function createEcho(opts) {
   // block that funds the next echo. Treat them as transient so the standard
   // backoff/retry covers the race; if the wallet is genuinely depleted the
   // retry loop still gives up at MAX_ATTEMPTS / RETRY_TTL_MS.
-  const TRANSIENT_RE = /no UTXOs for owner|no eligible base-currency UTXOs found for owner|requires a single base-currency UTXO|wallet send already pending|sidecar not ready|signer not configured|tracked owner not registered|queued tx not included|ECONNREFUSED|ECONNRESET|ETIMEDOUT|HTTP 5\d\d/i;
+  //
+  // `no signer configured for address` is the literal string the sidecar
+  // returns when /wallet/send is called for an owner whose secret_key was
+  // never POSTed to /wallet/signer (or has been wiped — see SIDECAR_LOST_RE
+  // below). Match the exact wording — the previous "signer not configured"
+  // pattern (different word order) silently never fired.
+  const TRANSIENT_RE = /no UTXOs for owner|no eligible base-currency UTXOs found for owner|requires a single base-currency UTXO|wallet send already pending|sidecar not ready|no signer configured|signer not configured|tracked owner not registered|queued tx not included|ECONNREFUSED|ECONNRESET|ETIMEDOUT|HTTP 5\d\d/i;
+
+  // Subset of TRANSIENT_RE whose meaning is "the sidecar's in-memory wallet
+  // bookkeeping was wiped" — typically because the sidecar process was
+  // restarted (deploy that reloads the archive snapshot, OOM, manual
+  // restart) while we were still running and the cached
+  // `signerConfigured` / `trackedOwnerAdded` flags below kept ensureReady
+  // from re-registering. Whenever we see these errors, clear the cached
+  // flags so the *next* ensureReady call re-POSTs /wallet/signer and
+  // /wallet/tracked_owner/add. The retry loop then re-issues /wallet/send
+  // and gets a real `queued:true` instead of looping forever on a stale
+  // 400. See PARTIAL_LEDGER_RECENT_TX_SOURCE_BUG / sidecar deploy notes
+  // in social-vibecoding's deploy.yml for the deploy-time trigger.
+  const SIDECAR_LOST_RE = /no signer configured|signer not configured|tracked owner not registered/i;
 
   // After /wallet/send returns queued:true with a tx_id, the sidecar can still
   // drop the tx silently — we've seen it disappear from mempool without ever
@@ -408,6 +427,24 @@ function createEcho(opts) {
     }
   }
 
+  // Drop the cached "we already registered with the sidecar" flags whenever
+  // the sidecar tells us it doesn't know about us. Without this, after a
+  // sidecar restart (deploy / OOM / manual) the flags below stay `true` and
+  // ensureReady becomes a no-op, so /wallet/send loops forever on
+  // `no signer configured for address …`. Called from sendEchoFor's send
+  // result + caught-error branches; the next sendEchoFor → ensureReady will
+  // re-POST /wallet/tracked_owner/add and /wallet/signer.
+  function invalidateReadinessIfSidecarLostState(errMsg) {
+    if (!errMsg || !SIDECAR_LOST_RE.test(errMsg)) return false;
+    if (!signerConfigured && !trackedOwnerAdded) return true;
+    console.warn(
+      `[echo] sidecar lost wallet state (${String(errMsg).slice(0, 120)}…) — clearing readiness flags so next ensureReady re-registers`
+    );
+    signerConfigured = false;
+    trackedOwnerAdded = false;
+    return true;
+  }
+
   // Watchdog: after the sidecar accepts /wallet/send and gives us a tx_id,
   // verify the tx actually lands. If it's neither on chain nor in mempool
   // after the grace period, requeue via scheduleRetry. Re-arms itself while
@@ -545,6 +582,7 @@ function createEcho(opts) {
         if (event.echoTxId) scheduleInclusionCheck(tx, event);
       } else {
         const errMsg = (resp && resp.error) || "send not queued";
+        invalidateReadinessIfSidecarLostState(errMsg);
         if (TRANSIENT_RE.test(errMsg)) {
           scheduleRetry(tx, event, errMsg);
         } else {
@@ -554,12 +592,14 @@ function createEcho(opts) {
         }
       }
     } catch (e) {
-      if (TRANSIENT_RE.test(e.message || "")) {
-        scheduleRetry(tx, event, e.message);
+      const msg = e.message || "";
+      invalidateReadinessIfSidecarLostState(msg);
+      if (TRANSIENT_RE.test(msg)) {
+        scheduleRetry(tx, event, msg);
       } else {
-        event.error = e.message;
+        event.error = msg;
         event.status = "failed";
-        console.error("[echo] send error:", e.message);
+        console.error("[echo] send error:", msg);
       }
     }
   }
