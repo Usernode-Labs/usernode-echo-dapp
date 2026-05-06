@@ -9,6 +9,8 @@
        a bridge edit produces a new URL the WebView has never seen. -->
   <script src="/usernode-bridge.js?v=__BUILD_VERSION__"></script>
   <script src="/usernode-usernames.js?v=__BUILD_VERSION__"></script>
+  <script src="/usernode-loading.js?v=__BUILD_VERSION__"></script>
+  <script>UsernodeLoading.init({ appName: "Echo", streamKey: "echo" });</script>
   <meta name="x-app-version" content="__BUILD_VERSION__" />
   <style>
     *, *::before, *::after { box-sizing: border-box; }
@@ -65,6 +67,8 @@
       padding: 3px 10px; border-radius: 999px;
       background: var(--chip-bg); color: var(--accent);
       border: 1px solid var(--border);
+      display: inline-block; text-align: center;
+      white-space: nowrap; flex-shrink: 0;
     }
     .scrollArea {
       flex: 1 1 auto; overflow-y: auto; min-height: 0;
@@ -314,10 +318,12 @@
       window.localStorage.getItem("echo:app_pubkey") ||
       "ut1rfa6arxcy84ysusvfg309ly6guk3kch9qvgktn32d88xk704u5tsges8uh";
 
-    // Sending wait budget: how long the bridge polls /transactions for the
-    // user's outbound tx after the wallet returns "queued". Sized to the
-    // worst-case mempool/inclusion latency we still consider "the network
-    // is just slow today", not "this tx is dropped".
+    // Point the bridge's inclusion polling at our server-side cache so we
+    // share the chain-poll work with every other connected client instead of
+    // each one re-polling the explorer. See lib/dapp-server.js + AGENTS.md.
+    window.usernode = window.usernode || {};
+    window.usernode.serverCacheUrl = "/__usernode/cache/" + APP_PUBKEY;
+
     const TX_SEND_OPTS = { timeoutMs: 180000, pollIntervalMs: 1500 };
     // Bump STORAGE_VERSION whenever the persisted history shape changes
     // (or any other echo:* key's shape changes). loadHistory() purges
@@ -446,21 +452,8 @@
 
        This matters because chain confirmation is ~30-60s; without a
        persistent visual after the user's tx confirms, the UI looks
-       frozen even though the echo round-trip is the longest part.
-
-       Both phases share the same escalation shape — green → amber at
-       WARN_S → red at ERR_S — and both top out at 3 minutes. The send
-       phase fails through TX_SEND_OPTS.timeoutMs (the bridge times
-       out and rejects); the echo phase fails through the explicit
-       timeout in startEchoPhaseProgressBar's tick (no chain-side
-       signal to depend on). */
+       frozen even though the echo round-trip is the longest part. */
     const TX_PB_EXPECTED_S = 60, TX_PB_WARN_S = 120, TX_PB_ERR_S = 180;
-    // Echo-receive escalation: visual amber → red at WARN_S, then a
-    // hard fail at ERR_S so a stuck "echoing" entry doesn't tick
-    // upward forever. ERR_S matches TX_SEND_OPTS.timeoutMs so a user
-    // who sees "Echo not received after 3m" can intuit "we already
-    // gave the underlying chain the same patience, twice — give up".
-    const ECHO_RECV_WARN_S = 120, ECHO_RECV_ERR_S = 180;
     let _pbRaf = null;
     let _pbPhase = "idle"; // "idle" | "sending" | "echoing" | "done"
     let _pbSendStart = 0;
@@ -596,41 +589,11 @@
       const tick = () => {
         if (_pbPhase !== "echoing") return;
         const s = (performance.now() - _pbEchoStart) / 1000;
-        // Hard fail at ECHO_RECV_ERR_S: nothing on the chain side will
-        // tell us "the echo isn't coming", so we have to draw the line
-        // ourselves. After this we leave the entry as `failed` and the
-        // UI is no longer live; if the echo eventually arrives a later
-        // pollServerState() pass will retroactively flip it to confirmed.
-        if (s >= ECHO_RECV_ERR_S) {
-          failEchoPhaseDueToTimeout(trackingTxId);
-          return;
-        }
         const text = "Waiting for echo… " + (s < 10 ? s.toFixed(1) : Math.round(s)) + "s";
-        const labelClass = s >= ECHO_RECV_WARN_S ? "tx-progress-label err" : "tx-progress-label warn";
-        pbSetLabel(text, labelClass, s < ECHO_RECV_WARN_S);
+        pbSetLabel(text, "tx-progress-label warn", true);
         _pbRaf = setTimeout(tick, PB_TICK_MS);
       };
       tick();
-    }
-
-    // Echo never arrived within ECHO_RECV_ERR_S — surface that to the
-    // history row (so it stops looking live) and to the progress bar
-    // (so the user sees a discrete "we gave up" terminus instead of
-    // a counter that ticks past 3 minutes). pollServerState may later
-    // overwrite status back to "confirmed" if the echo eventually
-    // lands; that's intentional — late truth wins over a guessed fail.
-    function failEchoPhaseDueToTimeout(txId) {
-      if (txId) {
-        const entry = history.find((h) => h.requestTxId === txId);
-        if (entry && entry.status === "echoing") {
-          entry.status = "failed";
-          entry.error = entry.error || "Echo not received within 3 minutes.";
-          persistHistory();
-          if (history[0] === entry) renderLatest(entry);
-          renderHistory();
-        }
-      }
-      failProgressBar("Echo not received after 3m");
     }
 
     /* Echo arrived — show green completion + total round-trip, then hide. */
@@ -720,8 +683,6 @@
       }
 
       const memo = JSON.stringify({ app: APP_ID, type: "send" });
-      const sentAtMs = performance.now();
-      const sentAtWall = Date.now();
 
       // Insert the entry up-front in "sending" status so the Latest
       // Attempt card swaps to *this* attempt immediately and shows a
@@ -729,12 +690,18 @@
       // inclusion. Without this, the previous attempt's results stay
       // frozen on screen for ~30-60s while the new tx is in flight,
       // which makes the UI look stuck.
+      //
+      // _sentAtPerf and sentAtWall are reset inside onSubmitted below
+      // so the live timer and the final sentLatencyMs measure pure
+      // submit → inclusion latency — excluding however long the user
+      // spent on the native confirm dialog, which would otherwise
+      // contaminate every send-phase number.
       const entry = {
         requestTxId: null,
         sentAmount: amount,
         expectedEcho: Math.max(1, amount - 1),
-        sentAtWall,
-        _sentAtPerf: sentAtMs,
+        sentAtWall: Date.now(),
+        _sentAtPerf: performance.now(),
         sentLatencyMs: null,
         echoLatencyMs: null,
         totalLatencyMs: null,
@@ -758,6 +725,16 @@
           ...TX_SEND_OPTS,
           confirmTitle: "Echo test",
           confirmSubtitle: `Send ${amount} tokens; ${amount - 1} will return.`,
+          // Bridge fires this the moment the wallet returns "queued"
+          // (post-dialog accept, pre-inclusion polling). Reset our
+          // send-clock so the live "Send → confirmed" timer ticks
+          // from real submission, not from the click that opened the
+          // confirm dialog.
+          onSubmitted: () => {
+            entry._sentAtPerf = performance.now();
+            entry.sentAtWall = Date.now();
+            persistHistory();
+          },
         });
         setSending(false, true);
       } catch (e) {
@@ -774,7 +751,7 @@
       const confirmedAtMs = performance.now();
       const requestTxId = extractTxId(result);
       entry.requestTxId = requestTxId || ("local-" + Date.now());
-      entry.sentLatencyMs = confirmedAtMs - sentAtMs;
+      entry.sentLatencyMs = confirmedAtMs - entry._sentAtPerf;
       entry.confirmedAtWall = Date.now();
       entry._confirmedAtPerf = confirmedAtMs;
       entry.status = requestTxId ? "echoing" : "pending";
@@ -799,7 +776,7 @@
       latestSentAmount.textContent = entry.sentAmount + " tokens";
       latestEchoAmount.textContent = entry.echoAmount != null
         ? entry.echoAmount + " tokens"
-        : "(expected " + entry.expectedEcho + ")";
+        : "(expecting " + entry.expectedEcho + ")";
 
       // Three latency rows. Each is either:
       //   • a final value (fmtMs of a recorded duration)

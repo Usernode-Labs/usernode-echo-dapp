@@ -31,7 +31,10 @@ const {
   loadEnvFile,
   handleExplorerProxy,
   createMockApi,
-  createChainPoller,
+  createAppStateCache,
+  createUsernamesCache,
+  createNodeStatusProbe,
+  createDappServerStatus,
 } = require("./lib/dapp-server");
 const createEcho = require("./echo-logic");
 
@@ -100,10 +103,66 @@ const echo = createEcho({
   localDev: LOCAL_DEV,
   mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
 });
+// echo.start() runs the sidecar /wallet/signer ensureReady loop; chain
+// plumbing (recipient + sender pollers, backfill, mock drain) is in echoCache
+// below.
 echo.start();
 
+const echoCache = createAppStateCache({
+  name: "echo",
+  appPubkey: ECHO_APP_PUBKEY,
+  queryFields: ["recipient", "sender"],
+  processTransaction: echo.processTransaction,
+  handleRequest: echo.handleRequest,
+  onChainReset(newId, oldId) {
+    console.log(`[echo] chain reset ${oldId} -> ${newId}, resetting state`);
+    echo.reset();
+  },
+  localDev: LOCAL_DEV,
+  mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
+  nodeRpcUrl: NODE_RPC_URL,
+});
+echoCache.start();
+
 app.use((req, res, next) => {
-  if (echo.handleRequest(req, res, req.path)) return;
+  if (echoCache.handleRequest(req, res, req.path)) return;
+  next();
+});
+
+// ── Global usernames cache ───────────────────────────────────────────────────
+// Same shared wiring as echoCache, just for the global usernames address.
+// Connected echo clients (and any other dapp the usernames module is loaded
+// into) hit `GET /__usernames/state` instead of independently paginating
+// the explorer. Public on purpose: usernames are global, identical for every
+// viewer.
+const usernamesCache = createUsernamesCache({
+  localDev: LOCAL_DEV,
+  mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
+  nodeRpcUrl: NODE_RPC_URL,
+});
+usernamesCache.start();
+
+app.use((req, res, next) => {
+  if (usernamesCache.handleRequest(req, res, req.path)) return;
+  next();
+});
+
+// ── Sidecar /status probe (powers /status page node card) ────────────────────
+// Polls the sidecar every 2s (fast during boot, slow once Synced) and caches
+// the snapshot at /__usernode/node_status. Per-cache stream readiness is
+// registered so the status page can show whether each cache's SSE link is
+// up — and so any future opt-in of usernode-loading.js's streamKey gate
+// works without further changes.
+const nodeStatusProbe = createNodeStatusProbe({
+  nodeRpcUrl: NODE_RPC_URL,
+  localDev: LOCAL_DEV,
+});
+nodeStatusProbe.registerStream("echo", () => echoCache.isStreamReady());
+nodeStatusProbe.registerStream("usernames", () => usernamesCache.isStreamReady());
+nodeStatusProbe.start();
+
+app.use((req, res, next) => {
+  if (nodeStatusProbe.handleRequest(req, res, req.path)) return;
   next();
 });
 
@@ -152,6 +211,31 @@ console.log(`  Build version: ${STARTUP_BUILD_VERSION}`);
 app.get("/__build", (_req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({ version: getBuildVersion(), localDev: LOCAL_DEV });
+});
+
+// ── Aggregated dapp-server status (HTML viewer + SSE) ───────────────────────
+// Exposes /status (HTML), /__usernode/status (JSON), and
+// /__usernode/status/stream (SSE). Operator-facing — public on purpose
+// (matches /__usernode/node_status and /__usernames/state).
+//
+// Mounted after the build-version block because getBuildVersion's body
+// references STARTUP_BUILD_VERSION (a `const`, in TDZ until evaluated).
+// Mounted before static + the catch-all HTML shell so /status doesn't
+// fall through to the LANDING_HTML auth wall.
+const dappServerStatus = createDappServerStatus({
+  name: "echo",
+  nodeProbe: nodeStatusProbe,
+  localDev: LOCAL_DEV,
+  port: PORT,
+  getBuildVersion,
+});
+dappServerStatus.registerCache(echoCache);
+dappServerStatus.registerCache(usernamesCache);
+dappServerStatus.registerPending("echo", () => echo.getPending());
+
+app.use((req, res, next) => {
+  if (dappServerStatus.handleRequest(req, res, req.path)) return;
+  next();
 });
 
 // ── Static assets ────────────────────────────────────────────────────────────
@@ -219,31 +303,6 @@ app.get("*", (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(renderIndexHtml());
 });
-
-// ── Chain pollers (production only) ──────────────────────────────────────────
-// Two pollers are required: the recipient one feeds incoming user→echo sends
-// into echo.processTransaction (which then triggers /wallet/send), and the
-// sender one catches the outgoing echo landing on chain so the round-trip
-// can be timestamped. Both share echo.processTransaction; deduplication is
-// handled inside echo-logic.
-function resetEcho(newId, oldId) {
-  console.log(`[echo] chain reset ${oldId} -> ${newId}, resetting state`);
-  echo.reset();
-}
-if (!LOCAL_DEV) {
-  createChainPoller({
-    appPubkey: ECHO_APP_PUBKEY,
-    queryField: "recipient",
-    onTransaction: echo.processTransaction,
-    onChainReset: resetEcho,
-  }).start();
-  createChainPoller({
-    appPubkey: ECHO_APP_PUBKEY,
-    queryField: "sender",
-    onTransaction: echo.processTransaction,
-    onChainReset: resetEcho,
-  }).start();
-}
 
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {

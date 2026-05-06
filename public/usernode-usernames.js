@@ -6,7 +6,15 @@
  *   await UsernodeUsernames.setUsername("alice")
  *   UsernodeUsernames.getUsernameSync(pubkey)
  *
- * All dapps share one usernames address. Set your name once, every dapp sees it.
+ * All dapps share one usernames address. Set your name once, every dapp
+ * sees it.
+ *
+ * Reads come from the host server's in-memory cache served at
+ * `GET /__usernames/state` — wired up via `createUsernamesCache` in
+ * `examples/lib/dapp-server.js`. The host server is required: this module
+ * does NOT fall back to paginating the chain itself, by design (every
+ * connected client doing that doesn't scale and is the anti-pattern called
+ * out in AGENTS.md Section 7).
  */
 (function () {
   "use strict";
@@ -17,6 +25,7 @@
 
   var TX_SEND_OPTS = { timeoutMs: 90000, pollIntervalMs: 1500 };
   var CACHE_TTL_MS = 30000;
+  var SERVER_CACHE_URL = "/__usernames/state";
 
   var cache = new Map();
   var lastFetch = 0;
@@ -49,71 +58,30 @@
     return (v.slice(0, maxBase) || "user") + suffix;
   }
 
-  /* ── Transaction parsing ─────────────────────────────── */
-
-  function parseMemo(m) {
-    if (m == null) return null;
-    try {
-      return JSON.parse(String(m));
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function extractTimestamp(tx) {
-    var candidates = [
-      tx.timestamp_ms,
-      tx.created_at,
-      tx.createdAt,
-      tx.timestamp,
-      tx.time,
-    ];
-    for (var i = 0; i < candidates.length; i++) {
-      var v = candidates[i];
-      if (typeof v === "number" && Number.isFinite(v))
-        return v < 10000000000 ? v * 1000 : v;
-      if (typeof v === "string" && v.trim()) {
-        var t = Date.parse(v);
-        if (!Number.isNaN(t)) return t;
-      }
-    }
-    return null;
-  }
-
-  function normalizeTx(tx) {
-    if (!tx || typeof tx !== "object") return null;
-    return {
-      id: tx.tx_id || tx.id || tx.txid || tx.hash || null,
-      from: tx.from_pubkey || tx.from || tx.source || null,
-      to: tx.destination_pubkey || tx.to || tx.destination || null,
-      amount: tx.amount || null,
-      memo: tx.memo != null ? String(tx.memo) : null,
-      ts: extractTimestamp(tx) || Date.now(),
-    };
-  }
-
-  /* ── Core fetch ──────────────────────────────────────── */
+  /* ── Core fetch: server cache only ───────────────────── */
 
   function fetchUsernameTxs() {
-    return window
-      .getTransactions({ limit: 500, account: USERNAMES_PUBKEY })
+    return fetch(SERVER_CACHE_URL, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      credentials: "same-origin",
+    })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      })
       .then(function (data) {
-        var items = data.items || [];
-        for (var i = 0; i < items.length; i++) {
-          var tx = normalizeTx(items[i]);
-          if (!tx || !tx.from || tx.to !== USERNAMES_PUBKEY) continue;
-          var memo = parseMemo(tx.memo);
-          if (
-            !memo ||
-            memo.app !== "usernames" ||
-            memo.type !== "set_username"
-          )
-            continue;
-          var name = normalizeUsername(memo.username, tx.from);
-          var prev = cache.get(tx.from);
-          if (!prev || tx.ts >= prev.ts) {
-            cache.set(tx.from, { name: name, ts: tx.ts });
-          }
+        if (!data || typeof data.usernames !== "object" || data.usernames === null) {
+          return;
+        }
+        var pubkeys = Object.keys(data.usernames);
+        for (var i = 0; i < pubkeys.length; i++) {
+          var pk = pubkeys[i];
+          var name = data.usernames[pk];
+          if (typeof name !== "string" || !name) continue;
+          // Server is the authoritative source; stamp ts as Date.now() so
+          // local writes (cache.set in setUsername) can still race ahead.
+          cache.set(pk, { name: name, ts: Date.now() });
         }
         lastFetch = Date.now();
       })
@@ -123,8 +91,7 @@
   }
 
   function ensureFresh() {
-    if (Date.now() - lastFetch < CACHE_TTL_MS)
-      return Promise.resolve();
+    if (Date.now() - lastFetch < CACHE_TTL_MS) return Promise.resolve();
     if (fetchPromise) return fetchPromise;
     fetchPromise = fetchUsernameTxs().then(
       function () { fetchPromise = null; },

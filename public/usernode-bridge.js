@@ -48,35 +48,14 @@
   var _inIframe = false;
   try { _inIframe = window !== window.parent; } catch (_) { _inIframe = false; }
 
-  // Frame-tagged log prefix so we can tell apart parent-frame and
-  // iframe-frame messages in the unified Flutter console stream
-  // (Android WebView's setOnConsoleMessage merges both into one feed
-  // with no source-frame info). The location host is included because
-  // social-vibecoding parent and embedded dapps run on different ports.
-  var _BRIDGE_TAG = "[bridge " + (_inIframe ? "iframe" : "top") + " " +
-    (typeof location !== "undefined" ? location.host : "?") + "]";
-  console.log(_BRIDGE_TAG, "loaded; inIframe=" + _inIframe +
-    " hasNativeChannel=" + _hasNativeChannel +
-    " hasUsernode=" + (typeof window.Usernode));
-
   // Android WebView injects `window.Usernode` into ALL frames, including
-  // cross-origin iframes — so naively `_hasNativeChannel` is true here
-  // too, and outgoing `Usernode.postMessage` calls from an iframe DO
-  // reach Flutter. The catch is the response leg: Flutter resolves
-  // promises with `controller.runJavaScript("window.__usernodeResolve(…)")`,
-  // and `runJavaScript` evaluates ONLY in the top frame. The iframe's
-  // pending-id map lives in the iframe's own `window`, so resolutions
-  // sent to the top frame never land — every iframe-initiated promise
-  // hangs forever.
-  //
-  // Forcing the iframe through the parent relay fixes this end-to-end:
-  // requests go iframe → parent → Flutter (top-frame Usernode), and
-  // resolutions go Flutter → top frame → parent (which IS where
-  // runJavaScript runs) → iframe via `postMessage`.
+  // cross-origin iframes. Outgoing `Usernode.postMessage` from an iframe
+  // works, but Flutter resolves promises via `runJavaScript`, which only
+  // evaluates in the top frame — so iframe-issued promises never resolve
+  // (the resolution lands in the top frame's pending-id map, not the
+  // iframe's). Force iframes through the parent relay so both legs of
+  // the round-trip route through the top frame.
   if (_inIframe && _hasNativeChannel) {
-    console.log(_BRIDGE_TAG,
-      "ignoring iframe-injected Usernode (Flutter resolves only in top frame);" +
-      " routing through parent relay");
     _hasNativeChannel = false;
   }
 
@@ -118,15 +97,12 @@
     return new Promise(function (resolve, reject) {
       window.__usernodeBridge.pending[id] = { resolve: resolve, reject: reject };
       var payload = { method: method, id: id, args: args || {} };
-      console.log(_BRIDGE_TAG, "callNative", method, "id", id,
-        "useIframeRelay=" + _useIframeRelay,
-        "hasNativeChannel=" + _hasNativeChannel);
       if (_useIframeRelay) {
         var timer = setTimeout(function () {
           var entry = window.__usernodeBridge.pending[id];
           if (!entry) return;
           delete window.__usernodeBridge.pending[id];
-          console.warn(_BRIDGE_TAG, "relay timeout for", method, "id", id);
+          console.warn("[usernode-bridge] relay timeout for", method, "id", id);
           reject(new Error(
             "Usernode relay timed out (parent page never responded). " +
             "Reload the host page so it picks up the latest bridge."
@@ -139,7 +115,7 @@
           reject: function (e) { clearTimeout(timer); origEntry.reject(e); },
         };
         try {
-          console.log(_BRIDGE_TAG, "relay → parent:", method, "id", id);
+          console.log("[usernode-bridge] relay → parent:", method, "id", id);
           window.parent.postMessage(
             { __usernode_relay: "request", id: id, method: method, args: args || {} },
             "*"
@@ -152,18 +128,9 @@
         return;
       }
       if (_hasNativeChannel) {
-        try {
-          console.log(_BRIDGE_TAG, "→ Usernode.postMessage", method, "id", id);
-          window.Usernode.postMessage(JSON.stringify(payload));
-        } catch (err) {
-          console.warn(_BRIDGE_TAG, "Usernode.postMessage threw:", err && err.message);
-          delete window.__usernodeBridge.pending[id];
-          reject(err);
-        }
+        window.Usernode.postMessage(JSON.stringify(payload));
         return;
       }
-      console.warn(_BRIDGE_TAG, "no transport for", method,
-        "(useIframeRelay=false, hasNativeChannel=false) — rejecting");
       delete window.__usernodeBridge.pending[id];
       reject(new Error("Usernode native bridge not available"));
     });
@@ -190,19 +157,19 @@
       if (!data) return;
       if (data.__usernode_relay === "discover-ack") {
         if (!_useIframeRelay) {
-          console.log(_BRIDGE_TAG, "iframe relay activated (parent ack received)");
+          console.log("[usernode-bridge] iframe relay activated (parent ack received)");
           _useIframeRelay = true;
           window.usernode.isNative = true;
         }
         return;
       }
       if (data.__usernode_relay === "response") {
-        console.log(_BRIDGE_TAG, "relay ← parent response id", data.id);
+        console.log("[usernode-bridge] relay ← parent response id", data.id);
         window.__usernodeResolve(data.id, data.value, data.error);
       }
     });
     try {
-      console.log(_BRIDGE_TAG, "sending discover ping to parent");
+      console.log("[usernode-bridge] sending discover ping to parent");
       window.parent.postMessage({ __usernode_relay: "discover" }, "*");
     } catch (_) { /* parent unreachable, stay non-native */ }
   }
@@ -218,14 +185,14 @@
   // in its own origin. The parent only relays raw Usernode.postMessage
   // payloads, which keeps cross-origin behaviour predictable.
   if (_hasNativeChannel) {
-    console.log(_BRIDGE_TAG, "native channel available, relay listener installed");
+    console.log("[usernode-bridge] parent: native channel available, relay listener installed");
     window.addEventListener("message", function (e) {
       var data = e.data;
       if (!data || !e.source) return;
       var origin = e.origin || "*";
       var source = e.source;
       if (data.__usernode_relay === "discover") {
-        console.log(_BRIDGE_TAG, "← discover from", origin, "→ acking");
+        console.log("[usernode-bridge] parent ← discover from", origin, "→ acking");
         try {
           source.postMessage({ __usernode_relay: "discover-ack" }, origin);
         } catch (_) { /* iframe gone, ignore */ }
@@ -235,8 +202,11 @@
       var origId = data.id;
       var nativeId = "relay-" + String(Date.now()) + "-" +
         Math.random().toString(16).slice(2);
-      console.log(_BRIDGE_TAG, "← relay request",
-        data.method, "id", origId, "→ native id", nativeId);
+      console.log(
+        "[usernode-bridge] parent ← relay request",
+        data.method,
+        "id", origId, "→ native id", nativeId
+      );
       function reply(value, error) {
         try {
           source.postMessage(
@@ -247,11 +217,11 @@
       }
       window.__usernodeBridge.pending[nativeId] = {
         resolve: function (v) {
-          console.log(_BRIDGE_TAG, "native resolve →", nativeId);
+          console.log("[usernode-bridge] parent native resolve →", nativeId);
           reply(v, null);
         },
         reject: function (err) {
-          console.log(_BRIDGE_TAG, "native reject →", nativeId, err);
+          console.log("[usernode-bridge] parent native reject →", nativeId, err);
           reply(null, (err && err.message) || String(err));
         },
       };
@@ -303,7 +273,14 @@
     var candidates = [];
     if (typeof sendResult === "string") candidates.push(sendResult);
     if (typeof sendResult === "object") {
+      // tx_id is the canonical explorer/server-cache field name, so it
+      // MUST be in this list — otherwise a matched tx from
+      // waitForTransactionVisible looks idless and _notifyNativeTxObserved
+      // silently drops the ack. That bug broke the "Last mile (dapp)"
+      // latency readout in the Flutter host for every dapp that relies on
+      // the server-cache transport.
       candidates.push(
+        sendResult.tx_id,
         sendResult.txid,
         sendResult.txId,
         sendResult.hash,
@@ -313,6 +290,7 @@
       );
       if (sendResult.tx && typeof sendResult.tx === "object") {
         candidates.push(
+          sendResult.tx.tx_id,
           sendResult.tx.id,
           sendResult.tx.txid,
           sendResult.tx.txId,
@@ -360,6 +338,58 @@
     return null;
   }
 
+  // ── Native ack helper ─────────────────────────────────────────────────
+  //
+  // When the bridge confirms a tx is on-chain (via waitForTransactionVisible)
+  // it lets the embedding native app know — so the app can stamp a
+  // "dapp-observed" timestamp distinct from its own explorer polling.
+  // Inside Flutter's WebView this surfaces as a "Last mile (dapp)" entry in
+  // the transaction-log latency row, complementing the explorer-derived
+  // numbers.
+  //
+  // Dedups per tx-id, so re-polls and explicit acks don't double-fire.
+  // Outside the native WebView (`window.Usernode.postMessage` absent) it's a
+  // silent no-op, so dapps can call this unconditionally.
+  //
+  // Dapps can also call window.usernode.acknowledgeTransaction(txId)
+  // directly when their own server-side state reflects the tx earlier
+  // than the bridge's poll (e.g. SSE-fed /__game/state, websocket fanout).
+  // The first ack wins on the native side.
+  var _observedTxIds = {};
+  function _notifyNativeTxObserved(txId) {
+    if (typeof txId !== "string") return;
+    var trimmed = txId.trim();
+    if (!trimmed) return;
+    if (_observedTxIds[trimmed]) return;
+    _observedTxIds[trimmed] = true;
+
+    var channel = window.Usernode;
+    if (
+      !channel ||
+      typeof channel !== "object" ||
+      typeof channel.postMessage !== "function"
+    ) {
+      return;
+    }
+    try {
+      channel.postMessage(
+        JSON.stringify({
+          method: "txObserved",
+          id: "tx_observed_" + trimmed,
+          args: { tx_id: trimmed, observed_at_ms: Date.now() },
+        })
+      );
+    } catch (e) {
+      console.warn("[usernode-bridge] tx_observed emit failed:", e);
+    }
+  }
+
+  window.usernode.acknowledgeTransaction = function acknowledgeTransaction(
+    txId
+  ) {
+    _notifyNativeTxObserved(txId);
+  };
+
   function txMatches(tx, expected) {
     if (!tx || typeof tx !== "object") return false;
 
@@ -398,6 +428,40 @@
     return true;
   }
 
+  // ── Inclusion-poll transport ──────────────────────────────────────────
+  //
+  // When the dapp sets window.usernode.serverCacheUrl, inclusion polls go
+  // straight to the dapp's server-side createAppStateCache (one shared
+  // poller behind the scenes) instead of having every client re-poll the
+  // explorer. The URL points at the cache mount, e.g. "/__usernode/cache/<appPubkey>";
+  // the bridge POSTs to "${url}/getTransactions". Response shape is
+  // { items: [...], count, total_in_cache } — same items[] contract as
+  // window.getTransactions, so the existing matcher works unchanged.
+  function _serverCacheUrl() {
+    var u = window.usernode && window.usernode.serverCacheUrl;
+    return typeof u === "string" && u ? u : null;
+  }
+
+  function _fetchInclusionPage(query) {
+    var base = _serverCacheUrl();
+    if (!base) return window.getTransactions(query);
+    return fetch(base + "/getTransactions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(query || {}),
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (!resp.ok) {
+        return resp.text().then(function (text) {
+          throw new Error(
+            "server-cache getTransactions failed (" + resp.status + "): " + text
+          );
+        });
+      }
+      return resp.json();
+    });
+  }
+
   function waitForTransactionVisible(expected, opts) {
     var timeoutMs =
       opts && typeof opts.timeoutMs === "number" ? opts.timeoutMs : 20000;
@@ -414,24 +478,26 @@
       query.sender = expected.from_pubkey;
     }
 
+    var transportLabel = _serverCacheUrl() ? "server-cache" : "getTransactions";
     var startedAt = Date.now();
     var attempt = 0;
 
     function poll() {
       attempt++;
-      return window.getTransactions(query).then(function (resp) {
+      return _fetchInclusionPage(query).then(function (resp) {
         var items = normalizeTransactionsResponse(resp);
         var found = null;
         for (var i = 0; i < items.length; i++) {
           if (txMatches(items[i], expected)) { found = items[i]; break; }
         }
         if (found) {
-          console.log("[usernode-bridge] tx found after", attempt, "polls,", Date.now() - startedAt, "ms");
+          console.log("[usernode-bridge] tx found after", attempt, "polls,", Date.now() - startedAt, "ms (via " + transportLabel + ")");
+          _notifyNativeTxObserved(extractTxId(found) || (expected && expected.txId));
           return found;
         }
 
         if (attempt <= 3 || attempt % 10 === 0) {
-          console.log("[usernode-bridge] waitForTx poll #" + attempt + ", " + items.length + " items, no match yet");
+          console.log("[usernode-bridge] waitForTx poll #" + attempt + ", " + items.length + " items, no match yet (via " + transportLabel + ")");
         }
 
         if (Date.now() - startedAt >= timeoutMs) {
@@ -441,12 +507,12 @@
           ]
             .filter(Boolean)
             .join(", ");
-          console.warn("[usernode-bridge] waitForTx timed out. expected:", JSON.stringify(expected));
+          console.warn("[usernode-bridge] waitForTx timed out (via " + transportLabel + "). expected:", JSON.stringify(expected));
           if (items.length > 0) {
             console.warn("[usernode-bridge] last poll sample (first item):", JSON.stringify(items[0]));
           }
           throw new Error(
-            "Timed out waiting for transaction to appear in getTransactions (" + timeoutMs + "ms, " + attempt + " polls" + (details ? ", " + details : "") + ")"
+            "Timed out waiting for transaction to appear (" + timeoutMs + "ms, " + attempt + " polls via " + transportLabel + (details ? ", " + details : "") + ")"
           );
         }
         return sleep(pollIntervalMs).then(poll);
@@ -3034,6 +3100,20 @@
   // =====================================================================
   //  Public API: sendTransaction
   // =====================================================================
+
+  // Fired once after a successful submit (queued onto the chain or written
+  // to the mock store), before inclusion polling begins. Lets latency-sensitive
+  // dapps mark the moment the tx actually left the bridge so they can exclude
+  // confirm-dialog dwell time from their own timers. A thrown callback is
+  // logged but does not fail the send. Not fired for the QR transport, which
+  // has no separate "submitted" inflection point — it only learns about the
+  // tx via on-chain polling.
+  function fireOnSubmitted(opts, sendResult) {
+    if (!opts || typeof opts.onSubmitted !== "function") return;
+    try { opts.onSubmitted(sendResult); }
+    catch (e) { console.warn("[usernode-bridge] onSubmitted callback threw:", e); }
+  }
+
   if (typeof window.sendTransaction !== "function") {
     function mockSendTransaction(destination_pubkey, amount, memo, opts) {
       var startedAt = Date.now();
@@ -3114,6 +3194,7 @@
         return resp.json();
       }).then(function (sendResult) {
         var sendFailed = sendResult && (sendResult.error || sendResult.queued === false);
+        if (!sendFailed) fireOnSubmitted(opts, sendResult);
         var shouldWait =
           !sendFailed && (!opts || opts.waitForInclusion == null ? true : !!opts.waitForInclusion);
         if (!shouldWait) return sendResult;
@@ -3147,6 +3228,7 @@
         var sendError = sendResult && sendResult.error;
         if (sendError) throw new Error(String(sendError));
         var sendFailed = sendResult && sendResult.queued === false;
+        if (!sendFailed) fireOnSubmitted(opts, sendResult);
         var shouldWait =
           !sendFailed && (!opts || opts.waitForInclusion == null ? true : !!opts.waitForInclusion);
         if (!shouldWait) return sendResult;
@@ -3164,11 +3246,6 @@
 
     window.sendTransaction = function sendTransaction(destination_pubkey, amount, memo, opts) {
       return isMockEnabled().then(function (useMock) {
-        var branch = useMock ? "mock" :
-          (window.usernode.isNative ? "native" : "qr");
-        console.log(_BRIDGE_TAG, "sendTransaction → branch=" + branch,
-          "isNative=" + !!window.usernode.isNative,
-          "useMock=" + useMock);
         if (useMock) return mockSendTransaction(destination_pubkey, amount, memo, opts);
         if (window.usernode.isNative) return nativeSendTransaction(destination_pubkey, amount, memo, opts);
         return qrSendTransaction(destination_pubkey, amount, memo, opts);

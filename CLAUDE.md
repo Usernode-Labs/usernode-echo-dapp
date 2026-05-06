@@ -53,6 +53,16 @@ startup, then `POST /wallet/send` for each echo. Both are idempotent
 (`ensureReady` retries on transient failure). No `--wallet-owner` flag is
 needed on the sidecar.
 
+## Direct-to-node live tail (opt-in)
+
+Set `USE_NODE_STREAM=1` in `.env` to bypass the explorer's 5–60s indexing
+lag for live transaction delivery. The cache replaces the explorer poller
+for the `recipient` queryField with `createNodeRecentTxStream` (SSE +
+catch-up poll against the sidecar's `/transactions/stream` and
+`/transactions/by_recipient` endpoints). Backfill and the `sender`
+queryField still go through the explorer. Off by default — needs a
+sidecar usernode build that exposes those endpoints.
+
 ## App-specific conventions
 
 - The pot is conceptually empty — echoes are funded by the difference
