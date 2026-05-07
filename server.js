@@ -30,6 +30,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 
+const dappServerLib = require("./lib/dapp-server");
 const {
   loadEnvFile,
   handleExplorerProxy,
@@ -38,10 +39,24 @@ const {
   createUsernamesCache,
   createNodeStatusProbe,
   createDappServerStatus,
-} = require("./lib/dapp-server");
+} = dappServerLib;
 const createEcho = require("./echo-logic");
 
 loadEnvFile();
+
+// Public explorer URL the dapp links to from each round-trip's "Block #N"
+// chip. Read after loadEnvFile() so any EXPLORER_UPSTREAM override in .env
+// is honored — the destructure-at-require-time pattern would have captured
+// the default before .env loaded. Hosts on private/loopback addresses get
+// http://; everything else gets https:// (matches lib/dapp-server.js's
+// explorerProto rule). The explorer SPA serves /blocks/:heightOrHash off
+// the same host as its /api/* JSON endpoints (testnet-explorer.usernodelabs.org).
+function getExplorerPublicBase() {
+  const host = dappServerLib.EXPLORER_UPSTREAM;
+  if (!host) return "";
+  const proto = /^(localhost|127\.|192\.|10\.|172\.)/.test(host) ? "http" : "https";
+  return `${proto}://${host}`;
+}
 
 // ── CLI flags ────────────────────────────────────────────────────────────────
 const LOCAL_DEV = process.argv.includes("--local-dev");
@@ -238,9 +253,17 @@ app.use(express.static(PUBLIC_DIR, {
 // client-side via the bridge (native channel inside the Flutter WebView,
 // QR fallback in a desktop browser).
 
-// Render the index.html template with __BUILD_VERSION__ substituted. Cached
-// in production (file set is frozen) and re-rendered on each request in
-// --local-dev so edits show up without a server restart.
+// Render the index.html template with placeholders substituted. Cached in
+// production (file set + env are frozen) and re-rendered on each request
+// in --local-dev so edits show up without a server restart.
+//
+// Substitutions:
+//   __BUILD_VERSION__       — content hash of public/, also used as a
+//                             cache-buster on bridge <script src=…> URLs.
+//   __EXPLORER_PUBLIC_BASE__ — base URL for the public block explorer (e.g.
+//                             https://testnet-explorer.usernodelabs.org)
+//                             so the dapp can link "Block #N" chips to
+//                             /blocks/<height> on the explorer SPA.
 let _indexHtmlCache = null;
 let _indexHtmlVersion = null;
 function renderIndexHtml() {
@@ -252,7 +275,9 @@ function renderIndexHtml() {
     } catch (e) {
       return `<!doctype html><pre>Failed to read index.html: ${e.message}</pre>`;
     }
-    _indexHtmlCache = raw.split("__BUILD_VERSION__").join(version);
+    _indexHtmlCache = raw
+      .split("__BUILD_VERSION__").join(version)
+      .split("__EXPLORER_PUBLIC_BASE__").join(getExplorerPublicBase());
     _indexHtmlVersion = version;
   }
   return _indexHtmlCache;

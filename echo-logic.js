@@ -51,6 +51,12 @@ function extractTimestamp(tx) {
 
 function normalizeTx(tx) {
   if (!tx || typeof tx !== "object") return null;
+  // block_height/block_hash come through cleanly from both the explorer
+  // shape (cache backfill, sender poller) and the node SSE shape (recipient
+  // live tail, mapped via _nodeEntryToExplorerShape in lib/dapp-server.js).
+  // Surfacing them lets the dapp link each round-trip to the explorer block
+  // page so testers can audit the on-chain side without leaving the app.
+  const bh = tx.block_height;
   return {
     id: tx.tx_id || tx.id || tx.txid || tx.hash || null,
     from: tx.from_pubkey || tx.from || tx.source || null,
@@ -58,6 +64,8 @@ function normalizeTx(tx) {
     amount: tx.amount != null ? Number(tx.amount) : 0,
     memo: tx.memo != null ? String(tx.memo) : null,
     ts: extractTimestamp(tx) || Date.now(),
+    blockHeight: typeof bh === "number" && Number.isFinite(bh) ? bh : null,
+    blockHash: typeof tx.block_hash === "string" ? tx.block_hash : null,
   };
 }
 
@@ -286,11 +294,15 @@ function createEcho(opts) {
       requestAmount: tx.amount,
       requestTs: tx.ts,
       requestSeenAtServerMs: Date.now(),
+      requestBlockHeight: tx.blockHeight,
+      requestBlockHash: tx.blockHash,
       echoAmount: null,
       echoSentAtServerMs: null,
       echoTxId: null,
       echoConfirmedTs: null,
       echoConfirmedAtServerMs: null,
+      echoBlockHeight: null,
+      echoBlockHash: null,
       error: null,
       status: "pending",
       retryAttempts: 0,
@@ -362,6 +374,8 @@ function createEcho(opts) {
         if (event.echoConfirmedTs == null) {
           event.echoConfirmedTs = tx.ts;
           event.echoConfirmedAtServerMs = Date.now();
+          event.echoBlockHeight = tx.blockHeight;
+          event.echoBlockHash = tx.blockHash;
           event.status = "confirmed";
           if (event._inclusionTimer) {
             clearTimeout(event._inclusionTimer);
@@ -378,6 +392,8 @@ function createEcho(opts) {
       if (event && event.echoConfirmedTs == null) {
         event.echoConfirmedTs = tx.ts;
         event.echoConfirmedAtServerMs = Date.now();
+        event.echoBlockHeight = tx.blockHeight;
+        event.echoBlockHash = tx.blockHash;
         if (!event.echoTxId) event.echoTxId = tx.id;
         event.status = "confirmed";
         // Cancel any retry / inclusion watchdog that might still fire.

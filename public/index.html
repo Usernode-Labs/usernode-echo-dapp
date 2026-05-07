@@ -211,8 +211,25 @@
     }
     .history-row:first-child { border-top: 0; }
     .history-row .left { font-size: 13px; }
-    .history-row .right { font-size: 12px; color: var(--muted); text-align: right; }
+    .history-row .right { font-size: 12px; color: var(--muted); text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
     .history-row .amount { font-weight: 600; }
+
+    /* Explorer block link (chip).
+       Surfaces the on-chain block height for the request tx and the echo
+       reply tx, linking to the explorer SPA's /blocks/:heightOrHash route.
+       Lets testers audit the on-chain side without leaving the dapp. */
+    .block-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+    .block-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 11px; font-variant-numeric: tabular-nums;
+      padding: 2px 8px; border-radius: 999px;
+      background: var(--chip-bg); color: var(--accent);
+      border: 1px solid var(--border);
+      text-decoration: none; line-height: 1.5;
+    }
+    .block-chip:hover, .block-chip:focus { text-decoration: underline; }
+    .block-chip .arrow { font-size: 10px; opacity: 0.7; }
+    .block-chip-label { font-size: 10px; color: var(--muted); margin-right: 2px; }
 
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
@@ -286,6 +303,10 @@
           </div>
         </div>
 
+        <!-- Block-height chips. Populated by renderLatest when the
+             request/echo block heights become known; hidden otherwise. -->
+        <div class="block-chips" id="latestBlocks" style="display:none"></div>
+
         <div class="hint err" id="latestError" style="display:none"></div>
       </div>
 
@@ -325,6 +346,11 @@
     window.usernode.serverCacheUrl = "/__usernode/cache/" + APP_PUBKEY;
 
     const TX_SEND_OPTS = { timeoutMs: 180000, pollIntervalMs: 1500 };
+    // Substituted by server.js's renderIndexHtml from EXPLORER_UPSTREAM env
+    // (defaults to https://testnet-explorer.usernodelabs.org). Empty string
+    // when no upstream is configured (e.g. an offline dev shell with the
+    // env var blanked) — UI suppresses the block links in that case.
+    const EXPLORER_PUBLIC_BASE = "__EXPLORER_PUBLIC_BASE__";
     // Bump STORAGE_VERSION whenever the persisted history shape changes
     // (or any other echo:* key's shape changes). loadHistory() purges
     // older versions on startup so stale entries from previous deploys —
@@ -364,6 +390,54 @@
       return pk.slice(0, 8) + "…" + pk.slice(-4);
     }
 
+    /* ── Explorer block links ──────────────────────────────────
+       The bridge merges the matched on-chain tx (block_height,
+       block_hash, timestamp_ms) onto sendResult.tx, so once
+       sendTransaction resolves we already know the request block.
+       The echo block comes back via /__echo/state once handleOutgoing
+       in echo-logic.js sees the reply. Both link to /blocks/<height>
+       on the explorer SPA — same host as its /api/* JSON endpoints. */
+    function extractBlockHeight(sendResult) {
+      if (!sendResult || typeof sendResult !== "object") return null;
+      const cands = [sendResult.block_height];
+      if (sendResult.tx && typeof sendResult.tx === "object") {
+        cands.push(sendResult.tx.block_height);
+      }
+      for (const v of cands) {
+        if (typeof v === "number" && Number.isFinite(v)) return v;
+      }
+      return null;
+    }
+
+    function buildBlockChip(label, height) {
+      if (typeof height !== "number" || !Number.isFinite(height)) return null;
+      // No public explorer configured — fall back to a non-linked chip so
+      // the height is still visible (useful when querying a localnet that
+      // doesn't have an SPA at the upstream host).
+      const useLink = !!EXPLORER_PUBLIC_BASE;
+      const node = document.createElement(useLink ? "a" : "span");
+      node.className = "block-chip";
+      if (useLink) {
+        node.href = EXPLORER_PUBLIC_BASE + "/blocks/" + encodeURIComponent(String(height));
+        node.target = "_blank";
+        node.rel = "noopener noreferrer";
+      }
+      const lbl = document.createElement("span");
+      lbl.className = "block-chip-label";
+      lbl.textContent = label;
+      const text = document.createElement("span");
+      text.textContent = "Block #" + height;
+      node.appendChild(lbl);
+      node.appendChild(text);
+      if (useLink) {
+        const arrow = document.createElement("span");
+        arrow.className = "arrow";
+        arrow.textContent = "↗";
+        node.appendChild(arrow);
+      }
+      return node;
+    }
+
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
@@ -383,6 +457,7 @@
     const serverEchoQueue = document.getElementById("serverEchoQueue");
     const serverChainRtt = document.getElementById("serverChainRtt");
     const latestError = document.getElementById("latestError");
+    const latestBlocks = document.getElementById("latestBlocks");
     const historyEl = document.getElementById("history");
 
     appPubkeyText.textContent = shortPk(APP_PUBKEY);
@@ -711,6 +786,8 @@
         server: null,
         confirmedAtWall: null,
         _confirmedAtPerf: null,
+        requestBlockHeight: null,
+        echoBlockHeight: null,
       };
       history.unshift(entry);
       if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
@@ -754,6 +831,11 @@
       entry.sentLatencyMs = confirmedAtMs - entry._sentAtPerf;
       entry.confirmedAtWall = Date.now();
       entry._confirmedAtPerf = confirmedAtMs;
+      // The bridge attaches the matched on-chain tx to sendResult.tx via
+      // attachMatchedTx, so we already have the request block height by
+      // the time sendTransaction resolves. The echo block comes later via
+      // /__echo/state.
+      entry.requestBlockHeight = extractBlockHeight(result);
       entry.status = requestTxId ? "echoing" : "pending";
       if (requestTxId) pendingByTxId.set(requestTxId, entry);
       persistHistory();
@@ -823,6 +905,18 @@
       } else {
         serverTimingSection.style.display = "none";
       }
+
+      // Block-height chips (request tx, echo tx). Heights arrive
+      // asynchronously: request from the bridge's matched tx as soon as
+      // sendTransaction resolves; echo from /__echo/state once the server
+      // sees the reply on chain. Each chip shows whichever heights we
+      // currently know.
+      latestBlocks.innerHTML = "";
+      const reqChip = buildBlockChip("Request", entry.requestBlockHeight);
+      const echoChip = buildBlockChip("Echo", entry.echoBlockHeight);
+      if (reqChip) latestBlocks.appendChild(reqChip);
+      if (echoChip) latestBlocks.appendChild(echoChip);
+      latestBlocks.style.display = (reqChip || echoChip) ? "flex" : "none";
 
       if (entry.error) {
         latestError.style.display = "block";
@@ -937,10 +1031,22 @@
 
         const right = document.createElement("div");
         right.className = "right";
-        const total = (h.sentLatencyMs != null && h.echoLatencyMs != null)
+        const totalText = (h.sentLatencyMs != null && h.echoLatencyMs != null)
           ? fmtMs(h.sentLatencyMs + h.echoLatencyMs)
           : (h.status === "skipped" || h.status === "failed" ? "—" : "…");
-        right.textContent = total;
+        const totalEl = document.createElement("div");
+        totalEl.textContent = totalText;
+        right.appendChild(totalEl);
+
+        // Block-height chip (echo block preferred; falls back to request
+        // block when the echo isn't on chain yet — typical for an entry
+        // still in flight). Skipped/failed entries that never produced an
+        // echo block get a request-block chip when one is known.
+        const histChip = buildBlockChip(
+          h.echoBlockHeight != null ? "Echo" : "Request",
+          h.echoBlockHeight != null ? h.echoBlockHeight : h.requestBlockHeight
+        );
+        if (histChip) right.appendChild(histChip);
 
         row.appendChild(left);
         row.appendChild(right);
@@ -1010,6 +1116,16 @@
         if (!ev) continue;
 
         if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
+        // Server-side block heights. requestBlockHeight is normally set
+        // synchronously from the bridge's matched tx, but populate it from
+        // the server too as a safety net (e.g. the bridge resolved before
+        // the cache had finished hydrating block_height for the request).
+        if (entry.requestBlockHeight == null && typeof ev.requestBlockHeight === "number") {
+          entry.requestBlockHeight = ev.requestBlockHeight;
+        }
+        if (entry.echoBlockHeight == null && typeof ev.echoBlockHeight === "number") {
+          entry.echoBlockHeight = ev.echoBlockHeight;
+        }
 
         if (ev.status === "skipped") {
           entry.status = "skipped";
