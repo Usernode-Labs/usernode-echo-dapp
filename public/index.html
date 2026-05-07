@@ -395,30 +395,42 @@
        block_hash, timestamp_ms) onto sendResult.tx, so once
        sendTransaction resolves we already know the request block.
        The echo block comes back via /__echo/state once handleOutgoing
-       in echo-logic.js sees the reply. Both link to /blocks/<height>
-       on the explorer SPA — same host as its /api/* JSON endpoints. */
-    function extractBlockHeight(sendResult) {
-      if (!sendResult || typeof sendResult !== "object") return null;
-      const cands = [sendResult.block_height];
-      if (sendResult.tx && typeof sendResult.tx === "object") {
-        cands.push(sendResult.tx.block_height);
+       in echo-logic.js sees the reply.
+
+       The explorer SPA's /blocks/:heightOrHash route accepts either,
+       but we prefer the hash when known: it's stable across reorgs
+       (a different block at the same height after a fork still links
+       to the right tx). The visible chip text always shows "#<height>"
+       since hashes are unwieldy. */
+    function extractBlockRef(sendResult) {
+      if (!sendResult || typeof sendResult !== "object") return { height: null, hash: null };
+      const candidates = [sendResult];
+      if (sendResult.tx && typeof sendResult.tx === "object") candidates.push(sendResult.tx);
+      let height = null, hash = null;
+      for (const c of candidates) {
+        if (height == null && typeof c.block_height === "number" && Number.isFinite(c.block_height)) {
+          height = c.block_height;
+        }
+        if (hash == null && typeof c.block_hash === "string" && c.block_hash) {
+          hash = c.block_hash;
+        }
       }
-      for (const v of cands) {
-        if (typeof v === "number" && Number.isFinite(v)) return v;
-      }
-      return null;
+      return { height, hash };
     }
 
-    function buildBlockChip(label, height) {
+    function buildBlockChip(label, height, hash) {
       if (typeof height !== "number" || !Number.isFinite(height)) return null;
       // No public explorer configured — fall back to a non-linked chip so
-      // the height is still visible (useful when querying a localnet that
-      // doesn't have an SPA at the upstream host).
+      // the height is still visible (useful for a localnet that doesn't
+      // serve the explorer SPA).
       const useLink = !!EXPLORER_PUBLIC_BASE;
       const node = document.createElement(useLink ? "a" : "span");
       node.className = "block-chip";
       if (useLink) {
-        node.href = EXPLORER_PUBLIC_BASE + "/blocks/" + encodeURIComponent(String(height));
+        // Prefer hash over height: the explorer route accepts both, and
+        // hash uniquely identifies the block across reorgs.
+        const ref = (typeof hash === "string" && hash) ? hash : String(height);
+        node.href = EXPLORER_PUBLIC_BASE + "/blocks/" + encodeURIComponent(ref);
         node.target = "_blank";
         node.rel = "noopener noreferrer";
       }
@@ -787,7 +799,9 @@
         confirmedAtWall: null,
         _confirmedAtPerf: null,
         requestBlockHeight: null,
+        requestBlockHash: null,
         echoBlockHeight: null,
+        echoBlockHash: null,
       };
       history.unshift(entry);
       if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
@@ -832,10 +846,12 @@
       entry.confirmedAtWall = Date.now();
       entry._confirmedAtPerf = confirmedAtMs;
       // The bridge attaches the matched on-chain tx to sendResult.tx via
-      // attachMatchedTx, so we already have the request block height by
-      // the time sendTransaction resolves. The echo block comes later via
-      // /__echo/state.
-      entry.requestBlockHeight = extractBlockHeight(result);
+      // attachMatchedTx, so we already have the request block height +
+      // hash by the time sendTransaction resolves. The echo block comes
+      // later via /__echo/state.
+      const reqRef = extractBlockRef(result);
+      entry.requestBlockHeight = reqRef.height;
+      entry.requestBlockHash = reqRef.hash;
       entry.status = requestTxId ? "echoing" : "pending";
       if (requestTxId) pendingByTxId.set(requestTxId, entry);
       persistHistory();
@@ -912,8 +928,8 @@
       // sees the reply on chain. Each chip shows whichever heights we
       // currently know.
       latestBlocks.innerHTML = "";
-      const reqChip = buildBlockChip("Request", entry.requestBlockHeight);
-      const echoChip = buildBlockChip("Echo", entry.echoBlockHeight);
+      const reqChip = buildBlockChip("Request", entry.requestBlockHeight, entry.requestBlockHash);
+      const echoChip = buildBlockChip("Echo", entry.echoBlockHeight, entry.echoBlockHash);
       if (reqChip) latestBlocks.appendChild(reqChip);
       if (echoChip) latestBlocks.appendChild(echoChip);
       latestBlocks.style.display = (reqChip || echoChip) ? "flex" : "none";
@@ -1038,13 +1054,15 @@
         totalEl.textContent = totalText;
         right.appendChild(totalEl);
 
-        // Block-height chip (echo block preferred; falls back to request
-        // block when the echo isn't on chain yet — typical for an entry
-        // still in flight). Skipped/failed entries that never produced an
-        // echo block get a request-block chip when one is known.
+        // Block chip (echo block preferred; falls back to request block
+        // when the echo isn't on chain yet — typical for an entry still
+        // in flight). Skipped/failed entries that never produced an echo
+        // block get a request-block chip when one is known.
+        const useEcho = h.echoBlockHeight != null;
         const histChip = buildBlockChip(
-          h.echoBlockHeight != null ? "Echo" : "Request",
-          h.echoBlockHeight != null ? h.echoBlockHeight : h.requestBlockHeight
+          useEcho ? "Echo" : "Request",
+          useEcho ? h.echoBlockHeight : h.requestBlockHeight,
+          useEcho ? h.echoBlockHash : h.requestBlockHash
         );
         if (histChip) right.appendChild(histChip);
 
@@ -1116,15 +1134,21 @@
         if (!ev) continue;
 
         if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
-        // Server-side block heights. requestBlockHeight is normally set
-        // synchronously from the bridge's matched tx, but populate it from
-        // the server too as a safety net (e.g. the bridge resolved before
-        // the cache had finished hydrating block_height for the request).
+        // Server-side block heights + hashes. requestBlock* is normally
+        // set synchronously from the bridge's matched tx, but populate it
+        // from the server too as a safety net (e.g. the bridge resolved
+        // before the cache had finished hydrating block_* for the request).
         if (entry.requestBlockHeight == null && typeof ev.requestBlockHeight === "number") {
           entry.requestBlockHeight = ev.requestBlockHeight;
         }
+        if (!entry.requestBlockHash && typeof ev.requestBlockHash === "string") {
+          entry.requestBlockHash = ev.requestBlockHash;
+        }
         if (entry.echoBlockHeight == null && typeof ev.echoBlockHeight === "number") {
           entry.echoBlockHeight = ev.echoBlockHeight;
+        }
+        if (!entry.echoBlockHash && typeof ev.echoBlockHash === "string") {
+          entry.echoBlockHash = ev.echoBlockHash;
         }
 
         if (ev.status === "skipped") {

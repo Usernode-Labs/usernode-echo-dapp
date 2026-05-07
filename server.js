@@ -30,7 +30,6 @@ const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 
-const dappServerLib = require("./lib/dapp-server");
 const {
   loadEnvFile,
   handleExplorerProxy,
@@ -39,23 +38,25 @@ const {
   createUsernamesCache,
   createNodeStatusProbe,
   createDappServerStatus,
-} = dappServerLib;
+} = require("./lib/dapp-server");
 const createEcho = require("./echo-logic");
 
 loadEnvFile();
 
 // Public explorer URL the dapp links to from each round-trip's "Block #N"
-// chip. Read after loadEnvFile() so any EXPLORER_UPSTREAM override in .env
-// is honored — the destructure-at-require-time pattern would have captured
-// the default before .env loaded. Hosts on private/loopback addresses get
-// http://; everything else gets https:// (matches lib/dapp-server.js's
-// explorerProto rule). The explorer SPA serves /blocks/:heightOrHash off
-// the same host as its /api/* JSON endpoints (testnet-explorer.usernodelabs.org).
+// chip. Deliberately *separate* from EXPLORER_UPSTREAM (which is the API
+// host the dapp polls): the explorer SPA and the explorer API are served
+// from different subdomains in the canonical deploy
+// (explorer.testnet.usernodelabs.org vs testnet-explorer.usernodelabs.org).
+//
+// Set EXPLORER_PUBLIC_BASE to disable links entirely (empty string) — the
+// chip falls back to a non-clickable span showing the height. Useful when
+// running against a localnet whose explorer SPA isn't reachable from the
+// user's browser.
 function getExplorerPublicBase() {
-  const host = dappServerLib.EXPLORER_UPSTREAM;
-  if (!host) return "";
-  const proto = /^(localhost|127\.|192\.|10\.|172\.)/.test(host) ? "http" : "https";
-  return `${proto}://${host}`;
+  const v = process.env.EXPLORER_PUBLIC_BASE;
+  if (typeof v === "string") return v.trim();
+  return "https://explorer.testnet.usernodelabs.org";
 }
 
 // ── CLI flags ────────────────────────────────────────────────────────────────
