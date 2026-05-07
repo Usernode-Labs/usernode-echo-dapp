@@ -815,7 +815,7 @@
         result = await window.sendTransaction(APP_PUBKEY, amount, memo, {
           ...TX_SEND_OPTS,
           confirmTitle: "Echo test",
-          confirmSubtitle: `Send ${amount} tokens; ${amount - 1} will return.`,
+          confirmSubtitle: `Echo — Send ${amount} tokens; ${amount - 1} will return.`,
           // Bridge fires this the moment the wallet returns "queued"
           // (post-dialog accept, pre-inclusion polling). Reset our
           // send-clock so the live "Send → confirmed" timer ticks
