@@ -34,7 +34,6 @@ echo/
                      proxy, env loader). Source: usernode-dapp-starter.
   public/
     index.html       UI (single-file HTML/CSS/JS).
-    usernode-bridge.js
     usernode-usernames.js
   Dockerfile         node:22-alpine, port 3000, /health probe.
   .env.example

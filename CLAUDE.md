@@ -24,9 +24,12 @@ conventions win.
 - `lib/dapp-server.js` — Vendored helpers (mock API, chain poller, explorer
   proxy, env loader). Copied from `usernode-dapp-starter`; do not edit
   in-place — re-vendor from upstream when fixes land there.
-- `public/` — Single-file HTML/JS UI plus the shared `usernode-bridge.js`
-  and `usernode-usernames.js`. The bridge is shared infrastructure; do not
-  fork it per-app.
+- `public/` — Single-file HTML/JS UI plus the shared `usernode-usernames.js`.
+  The bridge is loaded from
+  `https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js` —
+  canonical source lives in the social-vibecoding repo at
+  `public/usernode-bridge/v1/bridge.js`. Never vendor it per-app; bridge
+  fixes ship from one SV redeploy, fleet-wide.
 
 ## Running locally
 
