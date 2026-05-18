@@ -4,10 +4,38 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
   <title>Echo — Usernode latency test</title>
-  <!-- ?v=__BUILD_VERSION__ is replaced by server.js with a hash of public/.
-       This guarantees a cache-stuck WebView can't shadow new bridge code:
-       a bridge edit produces a new URL the WebView has never seen. -->
-  <script src="/usernode-bridge.js?v=__BUILD_VERSION__"></script>
+  <!-- Bridge centralization canary (Phase 2). Production loads the bridge
+       from Usernode Social Vibecoding's hosted /v1/ URL so every dapp in
+       the fleet shares a single source of truth — no more fan-out edits
+       across N vendored copies. Local dev (localhost / 127.0.0.1 / .local)
+       still loads the vendored public/usernode-bridge.js so offline
+       iteration works without an internet round-trip; the vendored copy
+       is the canary safety net during this phase. Once the SV-hosted
+       bridge is proven across the fleet we'll delete the vendored copies
+       and collapse the loader to a single hardcoded URL.
+
+       document.write preserves the synchronous-script semantics the rest
+       of this page depends on: getNodeAddress / sendTransaction / the
+       UsernodeLoading + UsernodeUsernames globals must exist before any
+       app script runs.
+
+       Cache strategy: SV serves /usernode-bridge/v1/bridge.js with
+       Cache-Control: no-cache, must-revalidate so every page load
+       revalidates via 304. We lose echo's ?v=__BUILD_VERSION__ cache-
+       buster for the bridge specifically; that's fine because the
+       no-cache header on SV's side achieves the same freshness guarantee
+       for any change within v1. Major-version bumps move to /v2/, which
+       segregates cache state naturally. -->
+  <script>
+    (function () {
+      var h = location.hostname;
+      var isLocal = h === "localhost" || h === "127.0.0.1" || h.endsWith(".local");
+      var src = isLocal
+        ? "/usernode-bridge.js?v=__BUILD_VERSION__"
+        : "https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js";
+      document.write('<script src="' + src + '"><' + '/script>');
+    })();
+  </script>
   <script src="/usernode-usernames.js?v=__BUILD_VERSION__"></script>
   <script src="/usernode-loading.js?v=__BUILD_VERSION__"></script>
   <script>UsernodeLoading.init({ appName: "Echo", streamKey: "echo" });</script>
