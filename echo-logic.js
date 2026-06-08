@@ -19,6 +19,7 @@
 
 const http = require("http");
 const https = require("https");
+const createEchoMetrics = require("./lib/echo-metrics");
 
 const APP_ID = "echo";
 
@@ -192,6 +193,29 @@ function createEcho(opts) {
   let signerConfigured = false;
   let trackedOwnerAdded = false;
 
+  // Historical metrics + automatic anomaly detection. Persists settled echoes
+  // and runs the rolling-baseline / threshold detector on a timer. Degrades to
+  // an in-memory store (persistent:false) if better-sqlite3 or the data dir is
+  // unavailable. liveProbe feeds the stall detector the ages of un-settled
+  // echoes straight from the events map.
+  const metrics = createEchoMetrics({
+    dataDir: opts.dataDir || null,
+    isStaging: !!opts.isStaging,
+    seedBaseline: !!opts.seedBaseline,
+    localDev,
+    epoch: opts.chainEpoch || "genesis",
+    liveProbe() {
+      const now = Date.now();
+      const unconfirmedAges = [];
+      for (const e of events.values()) {
+        if ((e.status === "pending" || e.status === "echoing") && e.requestSeenAtServerMs) {
+          unconfirmedAges.push(now - e.requestSeenAtServerMs);
+        }
+      }
+      return { unconfirmedAges };
+    },
+  });
+
   function trimSeenTxIds() {
     if (seenTxIds.size <= MAX_SEEN_TX_IDS) return;
     const drop = seenTxIds.size - Math.floor(MAX_SEEN_TX_IDS / 2);
@@ -234,6 +258,10 @@ function createEcho(opts) {
       events: list.slice(0, 50),
       eventCount: events.size,
       mode: localDev ? "mock" : "chain",
+      // Sanitized service-health hint for the public UI banner. Booleans and
+      // counts only — no addresses, error strings, or per-user data. Keeps the
+      // "same for every viewer" contract of the public /__echo/state endpoint.
+      health: metrics.getHealth(),
     };
   }
 
@@ -306,6 +334,7 @@ function createEcho(opts) {
       error: null,
       status: "pending",
       retryAttempts: 0,
+      rpcSendMs: null,
     };
     events.set(tx.id, event);
     trimEvents();
@@ -314,6 +343,7 @@ function createEcho(opts) {
       event.error = "amount must be ≥ 2 (echo returns N-1)";
       event.status = "skipped";
       console.log(`[echo] skip: ${tx.from.slice(0, 16)}… amount=${tx.amount} < 2`);
+      metrics.recordSample(event);
       return;
     }
 
@@ -382,6 +412,7 @@ function createEcho(opts) {
             event._inclusionTimer = null;
           }
           console.log(`[echo] confirmed (id-match): req=${event.requestTxId.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
+          metrics.recordSample(event);
         }
         return;
       }
@@ -407,6 +438,7 @@ function createEcho(opts) {
           event._inclusionTimer = null;
         }
         console.log(`[echo] confirmed (memo-match): req=${ref.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
+        metrics.recordSample(event);
       }
     }
   }
@@ -544,6 +576,7 @@ function createEcho(opts) {
       event.echoConfirmedAtServerMs = Date.now();
       event.status = "confirmed";
       console.log(`[echo] mock echo: ${replyAmount} → ${tx.from.slice(0, 16)}…`);
+      metrics.recordSample(event);
       return;
     }
 
@@ -585,6 +618,9 @@ function createEcho(opts) {
       });
       event.echoSentAtServerMs = Date.now();
       const sendDurationMs = event.echoSentAtServerMs - t0;
+      // Retain the RPC submit duration (previously only logged) so the metrics
+      // store can baseline it and getStateResponse can surface it.
+      event.rpcSendMs = sendDurationMs;
       if (resp && resp.queued) {
         event.echoTxId = resp.tx_id || resp.txid || resp.hash || null;
         event.status = "echoing";
@@ -605,6 +641,7 @@ function createEcho(opts) {
           event.error = errMsg;
           event.status = "failed";
           console.error("[echo] send rejected:", resp);
+          metrics.recordSample(event);
         }
       }
     } catch (e) {
@@ -616,6 +653,7 @@ function createEcho(opts) {
         event.error = msg;
         event.status = "failed";
         console.error("[echo] send error:", msg);
+        metrics.recordSample(event);
       }
     }
   }
@@ -643,6 +681,7 @@ function createEcho(opts) {
       event.status = "failed";
       retryState.delete(tx.id);
       console.error(`[echo] giving up on ${tx.id.slice(0, 12)}… after ${state.attempts} retries`);
+      metrics.recordSample(event);
       return;
     }
     state.attempts++;
@@ -677,7 +716,29 @@ function createEcho(opts) {
 
   // ── HTTP handler ─────────────────────────────────────────────────────────
 
+  // Operator-facing JSON: no permissive CORS header (unlike /__echo/state),
+  // and never any per-user field (anomaly rows are aggregate; request_from
+  // lives only in the private echo_samples table).
+  function sendOperatorJson(res, obj) {
+    const body = JSON.stringify(obj);
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(body);
+  }
+
   function handleRequest(req, res, pathname) {
+    if (pathname === "/__echo/anomalies" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") { res.writeHead(200); res.end(); return true; }
+      sendOperatorJson(res, metrics.getAnomaliesResponse());
+      return true;
+    }
+    if (pathname === "/__echo/metrics" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") { res.writeHead(200); res.end(); return true; }
+      sendOperatorJson(res, metrics.getMetricsResponse());
+      return true;
+    }
     if (pathname === "/__echo/state" && (req.method === "GET" || req.method === "HEAD")) {
       const body = JSON.stringify(getStateResponse());
       const headers = {
@@ -713,9 +774,11 @@ function createEcho(opts) {
         });
       })();
     }
+    // Run the anomaly detector on its ~30s timer.
+    metrics.start();
   }
 
-  function reset() {
+  function reset(newEpoch) {
     seenTxIds.clear();
     inFlight.clear();
     for (const ev of events.values()) {
@@ -732,6 +795,10 @@ function createEcho(opts) {
     retryState.clear();
     signerConfigured = false;
     trackedOwnerAdded = false;
+    // Tag subsequent samples/anomalies under the new chain epoch and
+    // auto-resolve anomalies from the prior epoch (the metrics store itself
+    // persists across the reset — only the in-memory event map is wiped).
+    if (newEpoch) metrics.setEpoch(String(newEpoch));
     console.log("[echo] state reset (chain restart detected)");
   }
 
@@ -740,6 +807,7 @@ function createEcho(opts) {
     handleRequest,
     getStateResponse,
     getPending,
+    getAnomalyStatusRows: () => metrics.getStatusRows(),
     start,
     reset,
     appPubkey,

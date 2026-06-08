@@ -74,6 +74,14 @@
       display: inline-block; text-align: center;
       white-space: nowrap; flex-shrink: 0;
     }
+    .healthBanner {
+      font-size: 12px; font-weight: 600;
+      padding: 8px 16px; text-align: center;
+      border-bottom: 1px solid var(--border);
+      color: #92400e; background: #fef3c7;
+    }
+    .healthBanner.critical { color: #7f1d1d; background: #fee2e2; }
+    .healthBanner.hide { display: none; }
     .scrollArea {
       flex: 1 1 auto; overflow-y: auto; min-height: 0;
       padding-bottom: max(16px, env(safe-area-inset-bottom));
@@ -255,6 +263,11 @@
       <span class="modePill" id="modePill">…</span>
     </div>
   </div>
+
+  <!-- Service-health banner. Hidden unless the server reports degraded health
+       (driven by state.health from /__echo/state). Non-alarming, no detail —
+       just enough to tell the user "it's the service, not your phone". -->
+  <div class="healthBanner hide" id="healthBanner" role="status"></div>
 
   <div class="scrollArea">
     <main>
@@ -460,6 +473,7 @@
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
+    const healthBanner = document.getElementById("healthBanner");
 
     const latestCard = document.getElementById("latestCard");
     const latestStatus = document.getElementById("latestStatus");
@@ -1109,6 +1123,43 @@
       return h;
     }
 
+    /* ── Service-health banner ────────────────────────────────
+       Driven by the sanitized `health` object on /__echo/state:
+       { degraded, openAnomalyCount, worst: "latency"|"failures"|"stall" }.
+       No detail beyond the category — just enough to reassure the user
+       that a slow/missing echo is the service, not their phone. */
+    function updateHealthBanner(health) {
+      if (!health || !health.degraded) {
+        healthBanner.classList.add("hide");
+        return;
+      }
+      let msg, critical = false;
+      switch (health.worst) {
+        case "stall":
+          msg = "Echoes are delayed right now — the service is catching up. Your tokens are safe.";
+          critical = true;
+          break;
+        case "failures":
+          msg = "Echoes are failing right now. Your tokens are safe; please try again shortly.";
+          critical = true;
+          break;
+        default:
+          msg = "Echo is running slower than usual right now.";
+      }
+      healthBanner.textContent = msg;
+      healthBanner.classList.toggle("critical", critical);
+      healthBanner.classList.remove("hide");
+    }
+
+    async function pollHealth() {
+      try {
+        const r = await fetch("/__echo/state", { cache: "no-store", headers: authHeaders() });
+        if (!r.ok) return;
+        const resp = await r.json();
+        updateHealthBanner(resp && resp.health);
+      } catch (_) {}
+    }
+
     /* ── Server state polling ─────────────────────────────── */
     async function pollServerState() {
       if (pendingByTxId.size === 0) return;
@@ -1121,6 +1172,7 @@
         if (!r.ok) return;
         resp = await r.json();
       } catch (_) { return; }
+      updateHealthBanner(resp && resp.health);
       if (!resp || !Array.isArray(resp.events)) return;
 
       const byId = new Map();
@@ -1269,6 +1321,11 @@
 
       setInterval(pollServerState, STATE_POLL_MS);
       pollServerState();
+
+      // Health banner polls on its own slower cadence so it stays current
+      // even when there are no pending echoes (pollServerState idles then).
+      setInterval(pollHealth, 10000);
+      pollHealth();
     })();
   </script>
 </body>
