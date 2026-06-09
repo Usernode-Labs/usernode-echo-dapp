@@ -350,6 +350,34 @@
     window.usernode.serverCacheUrl = "/__usernode/cache/" + APP_PUBKEY;
 
     const TX_SEND_OPTS = { timeoutMs: 180000, pollIntervalMs: 1500 };
+
+    // App-side send timeout. If a send is still awaiting chain inclusion
+    // after this long, we give up on the (uncancellable) bridge promise,
+    // reset the button to its ready state, and show a clear message —
+    // instead of leaving the user stuck with a perpetually-disabled Send
+    // button when inclusion is slow. The 180s bridge timeoutMs above stays
+    // as the outer ceiling; this is the shorter, primary limit.
+    //
+    // Overridable per-device via localStorage (mirrors the APP_PUBKEY
+    // override idiom) without a redeploy:
+    //   localStorage.setItem("echo:send_timeout_ms", "30000")
+    const SEND_TIMEOUT_MS = (() => {
+      const DEFAULT_MS = 60000;
+      try {
+        const raw = window.localStorage.getItem("echo:send_timeout_ms");
+        if (raw != null) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n > 0) return n;
+        }
+      } catch (_) {}
+      return DEFAULT_MS;
+    })();
+    // The clock is anchored to onSubmitted (real submission), so time on the
+    // confirm dialog / scanning a QR code doesn't count. As a backstop we arm
+    // a longer timer at click time in case onSubmitted never fires (bridge
+    // hangs before submission). Capped at the bridge's own timeoutMs.
+    const SEND_TIMEOUT_BACKSTOP_MS = Math.min(SEND_TIMEOUT_MS * 3, TX_SEND_OPTS.timeoutMs);
+
     // Substituted by server.js's renderIndexHtml from EXPLORER_UPSTREAM env
     // (defaults to https://testnet-explorer.usernodelabs.org). Empty string
     // when no upstream is configured (e.g. an offline dev shell with the
@@ -480,6 +508,11 @@
 
     /* ── State ────────────────────────────────────────────── */
     let sending = false;
+    // Bumped on every send. The async send flow captures its value at start;
+    // if a newer send begins (or the active one times out and is abandoned),
+    // a late resolve/reject of the now-stale bridge promise checks this token
+    // and becomes a UI no-op instead of clobbering current state.
+    let sendGeneration = 0;
     let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
     let pendingByTxId = new Map(); // requestTxId -> history entry
 
@@ -814,28 +847,88 @@
       renderHistory();
 
       setSending(true);
+
+      // Each send gets its own generation token. The timeout handler and the
+      // bridge promise's eventual settlement both check it: once a send has
+      // timed out (or a newer send started), the stale generation makes any
+      // late callback a no-op so it can't reset the button or overwrite a
+      // fresh attempt's state. See the `sendGeneration` declaration above.
+      const myGeneration = ++sendGeneration;
+
+      // App-side timeout that races the (uncancellable) bridge promise.
+      // Armed at click time as a backstop, then cleared + re-armed for the
+      // shorter SEND_TIMEOUT_MS window inside onSubmitted once the tx is
+      // actually submitted — so the clock measures submit → inclusion, not
+      // time spent on the confirm dialog / scanning a QR code.
+      let timeoutHandle = null;
+      let timedOut = false;
+      let timeoutReject = null;
+      const clearSendTimeout = () => {
+        if (timeoutHandle != null) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+      };
+      const armSendTimeout = (ms) => {
+        clearSendTimeout();
+        timeoutHandle = setTimeout(() => {
+          timeoutHandle = null;
+          timedOut = true;
+          if (typeof timeoutReject === "function") {
+            const err = new Error("Send timed out after " + ms + "ms");
+            err.isTimeout = true;
+            timeoutReject(err);
+          }
+        }, ms);
+      };
+      const timeoutPromise = new Promise((_, reject) => { timeoutReject = reject; });
+      armSendTimeout(SEND_TIMEOUT_BACKSTOP_MS);
+
       let result = null;
       try {
-        result = await window.sendTransaction(APP_PUBKEY, amount, memo, {
-          ...TX_SEND_OPTS,
-          confirmTitle: "Echo test",
-          confirmSubtitle: `Echo — Send ${amount} tokens; ${amount - 1} will return.`,
-          // Bridge fires this the moment the wallet returns "queued"
-          // (post-dialog accept, pre-inclusion polling). Reset our
-          // send-clock so the live "Send → confirmed" timer ticks
-          // from real submission, not from the click that opened the
-          // confirm dialog.
-          onSubmitted: () => {
-            entry._sentAtPerf = performance.now();
-            entry.sentAtWall = Date.now();
-            persistHistory();
-          },
-        });
+        result = await Promise.race([
+          window.sendTransaction(APP_PUBKEY, amount, memo, {
+            ...TX_SEND_OPTS,
+            // Hand the app-side limit to the bridge too so it stops its own
+            // inclusion polling / QR overlay around the same time we give up.
+            // The 180s default stays as the outer ceiling via Math.min.
+            timeoutMs: Math.min(SEND_TIMEOUT_BACKSTOP_MS, TX_SEND_OPTS.timeoutMs),
+            confirmTitle: "Echo test",
+            confirmSubtitle: `Echo — Send ${amount} tokens; ${amount - 1} will return.`,
+            // Bridge fires this the moment the wallet returns "queued"
+            // (post-dialog accept, pre-inclusion polling). Reset our
+            // send-clock so the live "Send → confirmed" timer ticks
+            // from real submission, not from the click that opened the
+            // confirm dialog. Also re-arm the timeout for the shorter
+            // submit → inclusion window now that we're actually waiting
+            // on the chain.
+            onSubmitted: () => {
+              if (myGeneration !== sendGeneration) return;
+              entry._sentAtPerf = performance.now();
+              entry.sentAtWall = Date.now();
+              persistHistory();
+              armSendTimeout(SEND_TIMEOUT_MS);
+            },
+          }),
+          timeoutPromise,
+        ]);
+        clearSendTimeout();
+        // A stale generation means a newer send superseded this one while we
+        // were awaiting; drop the result rather than touching shared UI/state.
+        if (myGeneration !== sendGeneration) return;
         setSending(false, true);
       } catch (e) {
+        clearSendTimeout();
+        // Ignore a late settlement of a send that already timed out / was
+        // superseded — the UI has moved on.
+        if (myGeneration !== sendGeneration) return;
         setSending(false, false);
         entry.status = "failed";
-        entry.error = "Send failed: " + (e && e.message ? e.message : String(e));
+        if (timedOut || (e && e.isTimeout)) {
+          const secs = Math.round(SEND_TIMEOUT_MS / 1000);
+          entry.error = "No confirmation after " + secs + "s — the network may " +
+            "be congested. Your send wasn't confirmed in time; it was not charged " +
+            "a fee, and you can try again. (It may still land on-chain later.)";
+        } else {
+          entry.error = "Send failed: " + (e && e.message ? e.message : String(e));
+        }
         persistHistory();
         if (history[0] === entry) renderLatest(entry);
         renderHistory();
