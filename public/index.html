@@ -238,6 +238,43 @@
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
+    /* Troubleshooting report (Recent attempts card header + preview).
+       The button reads quieter than the primary Send button: ghost
+       outline, muted text, accent on hover. */
+    .card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 12px;
+    }
+    .card-header h2 { margin: 0; }
+    button.ghost {
+      flex: 0 0 auto;
+      font-size: 12px; font-weight: 600;
+      padding: 6px 12px;
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 8px;
+      cursor: pointer; white-space: nowrap;
+      font-family: inherit;
+    }
+    button.ghost:hover, button.ghost:focus { color: var(--accent); border-color: var(--accent); }
+    .report-hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+    .report-hint.err { color: var(--err); }
+    .report-preview { margin-top: 12px; }
+    .report-preview summary {
+      font-size: 12px; color: var(--muted); cursor: pointer;
+      user-select: none; padding: 4px 0;
+    }
+    .report-preview summary:hover { color: var(--accent); }
+    .report-preview textarea {
+      width: 100%; margin-top: 8px;
+      min-height: 220px; resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; line-height: 1.5;
+      color: var(--fg); background: var(--bg);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px;
+      white-space: pre; overflow: auto;
+    }
+
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
       padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -316,8 +353,16 @@
 
       <!-- History -->
       <div class="card">
-        <h2>Recent attempts</h2>
+        <div class="card-header">
+          <h2>Recent attempts</h2>
+          <button id="copyReportBtn" class="ghost" type="button">Copy troubleshooting report</button>
+        </div>
         <div id="history"></div>
+        <div class="report-hint" id="reportHint" style="display:none"></div>
+        <details class="report-preview" id="reportPreview">
+          <summary>Preview report</summary>
+          <textarea id="reportText" readonly spellcheck="false" aria-label="Troubleshooting report preview"></textarea>
+        </details>
       </div>
 
       <!-- Info -->
@@ -1212,6 +1257,250 @@
         if (pbOutcome.kind === "ok") completeEchoPhaseProgressBar(pbOutcome.totalMs);
         else failProgressBar(pbOutcome.message);
       }
+    }
+
+    /* ── Troubleshooting report ───────────────────────────────
+       Builds a human-readable, copyable plain-text snapshot of the
+       current diagnostic state: environment context, the latest
+       attempt in full, and a compact recent-history summary. Sourced
+       entirely from already-available client state (history,
+       APP_PUBKEY, the mode pill, window.usernode.*) plus best-effort
+       reads of the existing public /__echo/state and /__build routes —
+       no new server route or DB. The platform JWT (?token=) is never
+       included; the page URL has its query string stripped. */
+    const copyReportBtn = document.getElementById("copyReportBtn");
+    const reportPreview = document.getElementById("reportPreview");
+    const reportText = document.getElementById("reportText");
+    const reportHint = document.getElementById("reportHint");
+
+    function redactedPageUrl() {
+      try {
+        const u = new URL(window.location.href);
+        // Strip the entire query string — it may carry the platform JWT
+        // (?token=…) and any other params we don't want in a pasted report.
+        const hadToken = u.searchParams.has("token");
+        u.search = "";
+        return u.toString() + (hadToken ? "  (token query param redacted)" : "");
+      } catch (_) { return "(unavailable)"; }
+    }
+
+    // Human latency + raw ms, e.g. "1.20 s (1203 ms)". Returns null for
+    // a missing/non-finite value so callers can pick their own placeholder.
+    function fmtMsRaw(ms) {
+      if (ms == null || !Number.isFinite(ms)) return null;
+      return fmtMs(ms) + " (" + Math.round(ms) + " ms)";
+    }
+
+    function isoOrDash(ms) {
+      if (ms == null || !Number.isFinite(ms)) return "—";
+      try { return new Date(ms).toISOString(); } catch (_) { return "—"; }
+    }
+
+    // Point-in-time total for an in-flight entry (no live ticker in the report).
+    function liveTotalForReport(entry) {
+      if (entry.status === "sending") return getSendElapsedMs(entry);
+      if (entry.status === "echoing") {
+        const e = getEchoElapsedMs(entry);
+        return e != null ? (entry.sentLatencyMs || 0) + e : null;
+      }
+      return null;
+    }
+
+    // Best-effort server reads. Never throws — falls back to local state.
+    async function collectReportContext() {
+      let serverState = null;
+      try {
+        const r = await fetch("/__echo/state", { cache: "no-store", headers: authHeaders() });
+        if (r.ok) serverState = await r.json();
+      } catch (_) {}
+      let build = null;
+      try {
+        const r = await fetch("/__build", { cache: "no-store" });
+        if (r.ok) build = await r.json();
+      } catch (_) {}
+      return { serverState, build };
+    }
+
+    function buildTroubleshootingReport(ctx) {
+      ctx = ctx || {};
+      const serverState = ctx.serverState || null;
+      const build = ctx.build || null;
+      const L = [];
+      const pad = (label) => (label + ":").padEnd(20, " ");
+
+      L.push("ECHO TROUBLESHOOTING REPORT");
+      L.push("Generated: " + new Date().toISOString());
+      L.push("");
+
+      // — Environment —
+      L.push("— Environment —");
+      L.push(pad("Mode") + ((modePill.textContent || "").trim() || "(unknown)"));
+      L.push(pad("Echo address") + (APP_PUBKEY || "(unknown)"));
+      const metaEl = document.querySelector('meta[name="x-app-version"]');
+      const metaVersion = (metaEl && metaEl.content) || "(unknown)";
+      let buildLine = (build && build.version) ? build.version : metaVersion;
+      if (build && typeof build.localDev === "boolean") buildLine += "  (localDev: " + build.localDev + ")";
+      L.push(pad("Build version") + buildLine);
+      const txBase = (window.usernode && window.usernode.transactionsBaseUrl) || null;
+      L.push(pad("Chain tx base") + (txBase || "(not set)"));
+      L.push(pad("Explorer base") + (EXPLORER_PUBLIC_BASE || "(disabled)"));
+      L.push(pad("Server state") + (serverState
+        ? "mode=" + (serverState.mode || "?") + " eventCount=" +
+            (serverState.eventCount != null ? serverState.eventCount : "?")
+        : "unavailable"));
+      L.push(pad("Page URL") + redactedPageUrl());
+      L.push(pad("User agent") + ((navigator && navigator.userAgent) || "(unknown)"));
+      L.push("");
+
+      // Server-side matched event for the latest attempt (echoTxId etc.)
+      const top = history[0] || null;
+      let serverEvent = null;
+      if (serverState && Array.isArray(serverState.events) && top && top.requestTxId) {
+        serverEvent = serverState.events.find(function (e) {
+          return e && e.requestTxId === top.requestTxId;
+        }) || null;
+      }
+
+      // — Latest attempt —
+      L.push("— Latest attempt —");
+      if (!top) {
+        L.push("none");
+      } else {
+        const inFlight = top.status === "sending" || top.status === "echoing" || top.status === "pending";
+        const inFlightDash = function (v) { return v != null ? v : (inFlight ? "(in progress)" : "—"); };
+
+        L.push(pad("Status") + top.status);
+        L.push(pad("Sent / echo") + top.sentAmount + " tokens → " +
+          (top.echoAmount != null ? top.echoAmount + " tokens" : "(pending)") +
+          "  (expected " + top.expectedEcho + ")");
+        L.push(pad("Request tx") + (top.requestTxId || "—"));
+        L.push(pad("Sent at") + isoOrDash(top.sentAtWall));
+        L.push(pad("Latency send→conf") + inFlightDash(fmtMsRaw(top.sentLatencyMs)));
+        L.push(pad("Latency conf→echo") + inFlightDash(fmtMsRaw(top.echoLatencyMs)));
+        const totalMs = (top.sentLatencyMs != null && top.echoLatencyMs != null)
+          ? top.sentLatencyMs + top.echoLatencyMs
+          : liveTotalForReport(top);
+        L.push(pad("Latency total") + inFlightDash(fmtMsRaw(totalMs)));
+
+        const sv = top.server;
+        const svField = function (v) {
+          return sv ? (fmtMsRaw(v) || "—") : (serverState ? "—" : "unavailable");
+        };
+        L.push(pad("Server poll lag") + svField(sv && sv.pollLagMs));
+        L.push(pad("Server echo queue") + svField(sv && sv.echoQueueMs));
+        L.push(pad("Server chain RTT") + svField(sv && sv.chainRttMs));
+
+        L.push(pad("Request block") + (top.requestBlockHeight != null
+          ? "#" + top.requestBlockHeight + "  " + (top.requestBlockHash || "—") : "—"));
+        L.push(pad("Echo block") + (top.echoBlockHeight != null
+          ? "#" + top.echoBlockHeight + "  " + (top.echoBlockHash || "—") : "—"));
+        const echoTxId = (serverEvent && serverEvent.echoTxId) || null;
+        L.push(pad("Echo tx") + (echoTxId || (serverState ? "—" : "unavailable")));
+        L.push(pad("Error") + (top.error || "none"));
+      }
+      L.push("");
+
+      // — Recent attempts —
+      L.push("— Recent attempts (most recent first, up to 20) —");
+      if (!history.length) {
+        L.push("none recorded");
+      } else {
+        history.slice(0, 20).forEach(function (h, i) {
+          const amt = h.sentAmount + " → " + (h.echoAmount != null ? h.echoAmount : "?");
+          const totalText = (h.sentLatencyMs != null && h.echoLatencyMs != null)
+            ? fmtMs(h.sentLatencyMs + h.echoLatencyMs)
+            : (h.status === "skipped" || h.status === "failed" ? "—" : "…");
+          const blk = h.echoBlockHeight != null ? "blk #" + h.echoBlockHeight
+            : (h.requestBlockHeight != null ? "blk #" + h.requestBlockHeight : "");
+          const req = h.requestTxId ? "req " + shortPk(h.requestTxId) : "req —";
+          let line = (i + 1) + ". " + amt.padEnd(10, " ") + " " +
+            String(h.status || "?").padEnd(10, " ") + " total " +
+            totalText.padEnd(9, " ") + " " + req;
+          if (blk) line += "   " + blk;
+          if ((h.status === "failed" || h.status === "skipped") && h.error) {
+            line += "   err: " + String(h.error).slice(0, 60);
+          }
+          L.push(line);
+        });
+      }
+
+      return L.join("\n");
+    }
+
+    let _copyLabelTimer = null;
+    function flashCopiedLabel(text) {
+      if (!copyReportBtn) return;
+      if (_copyLabelTimer) clearTimeout(_copyLabelTimer);
+      copyReportBtn.textContent = text;
+      _copyLabelTimer = setTimeout(function () {
+        copyReportBtn.textContent = "Copy troubleshooting report";
+        _copyLabelTimer = null;
+      }, 2000);
+    }
+
+    function showReportHint(msg, isErr) {
+      if (!reportHint) return;
+      reportHint.textContent = msg || "";
+      reportHint.style.display = msg ? "block" : "none";
+      reportHint.className = "report-hint" + (isErr ? " err" : "");
+    }
+
+    async function generateAndFillReport() {
+      let ctx;
+      try { ctx = await collectReportContext(); } catch (_) { ctx = {}; }
+      const report = buildTroubleshootingReport(ctx);
+      if (reportText) reportText.value = report;
+      return report;
+    }
+
+    async function onCopyReport() {
+      showReportHint("", false);
+      let report;
+      try { report = await generateAndFillReport(); }
+      catch (_) {
+        report = buildTroubleshootingReport({});
+        if (reportText) reportText.value = report;
+      }
+
+      let copied = false;
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(report);
+          copied = true;
+        }
+      } catch (_) { copied = false; }
+
+      if (!copied) {
+        // Legacy fallback: reveal preview, select the textarea, try execCommand.
+        if (reportPreview) reportPreview.open = true;
+        if (reportText) {
+          reportText.focus();
+          reportText.select();
+          try { copied = !!(document.execCommand && document.execCommand("copy")); }
+          catch (_) { copied = false; }
+        }
+      }
+
+      if (copied) {
+        flashCopiedLabel("Copied ✓");
+        showReportHint("", false);
+      } else {
+        if (reportPreview) reportPreview.open = true;
+        if (reportText) { reportText.focus(); reportText.select(); }
+        showReportHint("Copy failed — select the text above and copy manually.", true);
+      }
+    }
+
+    if (copyReportBtn) copyReportBtn.addEventListener("click", onCopyReport);
+    // Regenerate the preview each time the user opens it so it never shows
+    // a stale snapshot.
+    if (reportPreview) {
+      reportPreview.addEventListener("toggle", function () {
+        if (!reportPreview.open) return;
+        generateAndFillReport().catch(function () {
+          if (reportText) reportText.value = buildTroubleshootingReport({});
+        });
+      });
     }
 
     /* ── Init ─────────────────────────────────────────────── */
