@@ -38,6 +38,7 @@ const {
   createUsernamesCache,
   createNodeStatusProbe,
   createDappServerStatus,
+  discoverChainInfo,
 } = require("./lib/dapp-server");
 const createEcho = require("./echo-logic");
 
@@ -95,10 +96,20 @@ const echo = createEcho({
   localDev: LOCAL_DEV,
   mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
 });
-// echo.start() runs the sidecar /wallet/signer ensureReady loop; chain
-// plumbing (recipient + sender pollers, backfill, mock drain) is in echoCache
-// below.
-echo.start();
+// echo.start() runs the sidecar /wallet/signer ensureReady loop + hydrates
+// the durable diagnostic log into memory; chain plumbing (recipient + sender
+// pollers, backfill, mock drain) is in echoCache below. We discover the
+// active chain id *first* (in chain mode) so the durable rows are stamped and
+// hydrated under the right chain_id. onChainReset keeps it current afterwards.
+(async () => {
+  if (!LOCAL_DEV) {
+    try {
+      const info = await discoverChainInfo();
+      if (info && info.chainId) echo.setChainId(info.chainId);
+    } catch (_) {}
+  }
+  echo.start();
+})();
 
 const echoCache = createAppStateCache({
   name: "echo",
@@ -108,6 +119,9 @@ const echoCache = createAppStateCache({
   handleRequest: echo.handleRequest,
   onChainReset(newId, oldId) {
     console.log(`[echo] chain reset ${oldId} -> ${newId}, resetting state`);
+    // Stamp new rows with the new chain id; the durable log keeps the old
+    // chain's rows (history is preserved, reads scope to the current chain).
+    echo.setChainId(newId);
     echo.reset();
   },
   localDev: LOCAL_DEV,

@@ -19,6 +19,7 @@
 
 const http = require("http");
 const https = require("https");
+const createEchoStore = require("./echo-store");
 
 const APP_ID = "echo";
 
@@ -118,6 +119,25 @@ function createEcho(opts) {
   const nodeRpcUrl = opts.nodeRpcUrl || "http://localhost:3000";
   const localDev = !!opts.localDev;
   const mockTransactions = opts.mockTransactions || null;
+
+  // Durable write-through mirror of the in-memory `events` Map. Disabled
+  // (no-op) when DATABASE_URL is absent or the DB is unreachable — echo then
+  // runs in-memory only, exactly as before.
+  const store = opts.store || createEchoStore({ databaseUrl: opts.databaseUrl });
+
+  // Active chain id, used to stamp/scope durable rows. Set by the surrounding
+  // server wiring (initial discovery + onChainReset). Mock mode has no chain,
+  // so rows are scoped under a stable sentinel.
+  let chainId = localDev ? "mock" : null;
+  function effectiveChainId() {
+    return chainId || (localDev ? "mock" : "unknown");
+  }
+  function setChainId(id) {
+    if (id && id !== chainId) {
+      chainId = id;
+      console.log(`[echo] chain_id set: ${id}`);
+    }
+  }
 
   const MAX_EVENTS = 200;
   const MAX_SEEN_TX_IDS = 5000;
@@ -227,14 +247,114 @@ function createEcho(opts) {
     }
   }
 
+  // Derive the structured error category from the event's current state.
+  // Pure function of fields the state machine already sets — it does NOT
+  // change retry policy, only labels the situation for the UI:
+  //   skip      — amount < 2; never retried
+  //   transient — matched TRANSIENT_RE and currently in backoff
+  //   permanent — non-transient rejection or retry budget exhausted
+  //   null      — no error
+  function classify(event) {
+    if (!event || !event.error) {
+      event.errorCategory = null;
+      return;
+    }
+    if (event.status === "skipped") event.errorCategory = "skip";
+    else if (event.status === "failed") event.errorCategory = "permanent";
+    else if (event.retryAttempts > 0) event.errorCategory = "transient";
+    else event.errorCategory = null;
+  }
+
+  // Write-through to the durable store. Classifies first so error_category is
+  // persisted consistently. Fire-and-forget; never throws into callers.
+  function persistEvent(event) {
+    if (!event) return;
+    classify(event);
+    store.persist(event, effectiveChainId());
+  }
+
+  // Strip internal-only fields (e.g. the inclusion-watchdog Timeout) and
+  // guarantee the structured error fields are present for the client.
+  function publicEvent(event) {
+    classify(event);
+    return {
+      requestTxId: event.requestTxId,
+      requestFrom: event.requestFrom,
+      requestAmount: event.requestAmount,
+      requestTs: event.requestTs,
+      requestSeenAtServerMs: event.requestSeenAtServerMs,
+      requestBlockHeight: event.requestBlockHeight,
+      requestBlockHash: event.requestBlockHash,
+      echoAmount: event.echoAmount,
+      echoSentAtServerMs: event.echoSentAtServerMs,
+      echoTxId: event.echoTxId,
+      echoConfirmedTs: event.echoConfirmedTs,
+      echoConfirmedAtServerMs: event.echoConfirmedAtServerMs,
+      echoBlockHeight: event.echoBlockHeight,
+      echoBlockHash: event.echoBlockHash,
+      error: event.error || null,
+      errorCategory: event.errorCategory || null,
+      nextRetryAtMs: event.nextRetryAtMs != null ? event.nextRetryAtMs : null,
+      status: event.status,
+      retryAttempts: event.retryAttempts || 0,
+    };
+  }
+
   function getStateResponse() {
     const list = Array.from(events.values()).sort((a, b) => b.requestTs - a.requestTs);
     return {
       appPubkey,
-      events: list.slice(0, 50),
+      events: list.slice(0, 50).map(publicEvent),
       eventCount: events.size,
       mode: localDev ? "mock" : "chain",
     };
+  }
+
+  // ── Percentile / stats helpers (in-memory fallback when DB is off) ────────
+  function percentile(sortedAsc, p) {
+    if (!sortedAsc.length) return null;
+    const idx = (sortedAsc.length - 1) * p;
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    if (lo === hi) return sortedAsc[lo];
+    return sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (idx - lo);
+  }
+
+  // Compute the same stats shape the SQL path returns, over a window of the
+  // most-recent terminal in-memory events. Clamps negative latencies to 0.
+  function computeStatsFromMemory(windowSize = 200) {
+    const terminal = Array.from(events.values())
+      .filter((e) => e.status === "confirmed" || e.status === "failed" || e.status === "skipped")
+      .sort((a, b) => (b.requestSeenAtServerMs || b.requestTs || 0) - (a.requestSeenAtServerMs || a.requestTs || 0))
+      .slice(0, windowSize);
+    const confirmed = terminal.filter((e) => e.status === "confirmed");
+    const totals = confirmed
+      .filter((e) => e.echoConfirmedTs != null && e.requestTs != null)
+      .map((e) => Math.max(0, e.echoConfirmedTs - e.requestTs))
+      .sort((a, b) => a - b);
+    const queues = confirmed
+      .filter((e) => e.echoSentAtServerMs != null && e.requestSeenAtServerMs != null)
+      .map((e) => Math.max(0, e.echoSentAtServerMs - e.requestSeenAtServerMs))
+      .sort((a, b) => a - b);
+    const total = terminal.length;
+    const confirmedN = confirmed.length;
+    return {
+      total,
+      confirmed: confirmedN,
+      failed: terminal.filter((e) => e.status === "failed").length,
+      skipped: terminal.filter((e) => e.status === "skipped").length,
+      successRate: total > 0 ? confirmedN / total : null,
+      medianTotalMs: percentile(totals, 0.5),
+      p95TotalMs: percentile(totals, 0.95),
+      medianServerEchoQueueMs: percentile(queues, 0.5),
+    };
+  }
+
+  // Newest-first list of all in-memory events as public rows (history
+  // fallback when the DB is off). Sorted by request arrival time.
+  function memoryHistoryList() {
+    return Array.from(events.values())
+      .sort((a, b) => (b.requestSeenAtServerMs || b.requestTs || 0) - (a.requestSeenAtServerMs || a.requestTs || 0))
+      .map(publicEvent);
   }
 
   // Snapshot of in-flight echoes for /__usernode/status. Only the rows that
@@ -304,16 +424,20 @@ function createEcho(opts) {
       echoBlockHeight: null,
       echoBlockHash: null,
       error: null,
+      errorCategory: null,
+      nextRetryAtMs: null,
       status: "pending",
       retryAttempts: 0,
     };
     events.set(tx.id, event);
     trimEvents();
+    persistEvent(event);
 
     if (!Number.isFinite(tx.amount) || tx.amount < 2) {
       event.error = "amount must be ≥ 2 (echo returns N-1)";
       event.status = "skipped";
       console.log(`[echo] skip: ${tx.from.slice(0, 16)}… amount=${tx.amount} < 2`);
+      persistEvent(event);
       return;
     }
 
@@ -326,6 +450,7 @@ function createEcho(opts) {
       if (event.echoConfirmedTs == null) {
         event.status = "confirmed";
       }
+      persistEvent(event);
       return;
     }
 
@@ -348,6 +473,7 @@ function createEcho(opts) {
       if (respondedRefs.has(tx.id) || ev.echoConfirmedTs != null) {
         ev.echoAmount = Math.max(1, tx.amount - 1);
         if (ev.echoConfirmedTs == null) ev.status = "confirmed";
+        persistEvent(ev);
         inFlight.delete(tx.id);
         return;
       }
@@ -381,6 +507,7 @@ function createEcho(opts) {
             clearTimeout(event._inclusionTimer);
             event._inclusionTimer = null;
           }
+          persistEvent(event);
           console.log(`[echo] confirmed (id-match): req=${event.requestTxId.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
         }
         return;
@@ -406,6 +533,7 @@ function createEcho(opts) {
           clearTimeout(event._inclusionTimer);
           event._inclusionTimer = null;
         }
+        persistEvent(event);
         console.log(`[echo] confirmed (memo-match): req=${ref.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
       }
     }
@@ -543,6 +671,8 @@ function createEcho(opts) {
       event.echoConfirmedTs = Date.parse(nowIso);
       event.echoConfirmedAtServerMs = Date.now();
       event.status = "confirmed";
+      event.nextRetryAtMs = null;
+      persistEvent(event);
       console.log(`[echo] mock echo: ${replyAmount} → ${tx.from.slice(0, 16)}…`);
       return;
     }
@@ -552,6 +682,7 @@ function createEcho(opts) {
     if (respondedRefs.has(tx.id)) {
       event.echoAmount = replyAmount;
       if (event.echoConfirmedTs == null) event.status = "confirmed";
+      event.nextRetryAtMs = null;
       const state = retryState.get(tx.id);
       if (state && state.timer) clearTimeout(state.timer);
       retryState.delete(tx.id);
@@ -559,6 +690,7 @@ function createEcho(opts) {
         clearTimeout(event._inclusionTimer);
         event._inclusionTimer = null;
       }
+      persistEvent(event);
       return;
     }
 
@@ -589,9 +721,11 @@ function createEcho(opts) {
         event.echoTxId = resp.tx_id || resp.txid || resp.hash || null;
         event.status = "echoing";
         event.error = null;
+        event.nextRetryAtMs = null;
         const state = retryState.get(tx.id);
         if (state && state.timer) clearTimeout(state.timer);
         retryState.delete(tx.id);
+        persistEvent(event);
         console.log(`[echo] queued ${replyAmount} → ${tx.from.slice(0, 16)}… (req=${tx.id.slice(0, 12)}…, rpc=${sendDurationMs}ms)`);
         // The sidecar can still drop this tx silently before inclusion. Arm
         // a watchdog that requeues if the tx_id never makes it on-chain.
@@ -604,6 +738,8 @@ function createEcho(opts) {
         } else {
           event.error = errMsg;
           event.status = "failed";
+          event.nextRetryAtMs = null;
+          persistEvent(event);
           console.error("[echo] send rejected:", resp);
         }
       }
@@ -615,6 +751,8 @@ function createEcho(opts) {
       } else {
         event.error = msg;
         event.status = "failed";
+        event.nextRetryAtMs = null;
+        persistEvent(event);
         console.error("[echo] send error:", msg);
       }
     }
@@ -626,6 +764,7 @@ function createEcho(opts) {
       event.echoAmount = Math.max(1, tx.amount - 1);
       if (event.echoConfirmedTs == null) event.status = "confirmed";
       event.error = null;
+      event.nextRetryAtMs = null;
       const state = retryState.get(tx.id);
       if (state && state.timer) clearTimeout(state.timer);
       retryState.delete(tx.id);
@@ -633,6 +772,7 @@ function createEcho(opts) {
         clearTimeout(event._inclusionTimer);
         event._inclusionTimer = null;
       }
+      persistEvent(event);
       return;
     }
     // Cap retries by attempt count and overall age so failures don't loop forever.
@@ -641,7 +781,9 @@ function createEcho(opts) {
     if (state.attempts >= RETRY_MAX_ATTEMPTS || ageMs >= RETRY_TTL_MS) {
       event.error = `${errMsg} (gave up after ${state.attempts} retries, ${Math.round(ageMs / 1000)}s)`;
       event.status = "failed";
+      event.nextRetryAtMs = null;
       retryState.delete(tx.id);
+      persistEvent(event);
       console.error(`[echo] giving up on ${tx.id.slice(0, 12)}… after ${state.attempts} retries`);
       return;
     }
@@ -652,7 +794,9 @@ function createEcho(opts) {
     );
     event.status = "pending";
     event.retryAttempts = state.attempts;
+    event.nextRetryAtMs = Date.now() + delayMs;
     event.error = `${errMsg} — retry ${state.attempts}/${RETRY_MAX_ATTEMPTS} in ${Math.round(delayMs / 1000)}s`;
+    persistEvent(event);
     if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => {
       state.timer = null;
@@ -677,21 +821,76 @@ function createEcho(opts) {
 
   // ── HTTP handler ─────────────────────────────────────────────────────────
 
+  const JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*",
+  };
+
+  function sendJson(req, res, obj) {
+    const body = JSON.stringify(obj);
+    if (req.method === "HEAD") {
+      res.writeHead(200, { ...JSON_HEADERS, "content-length": Buffer.byteLength(body) });
+      res.end();
+      return;
+    }
+    res.writeHead(200, JSON_HEADERS);
+    res.end(body);
+  }
+
+  // Durable, paginated global log + aggregate stats. Reads from the Postgres
+  // mirror when available, else falls back to the in-memory Map. Public GET
+  // (no /api/ prefix, no auth) — same posture as /__echo/state.
+  async function handleHistory(req, res) {
+    let limit = 25;
+    let before = null;
+    try {
+      const u = new URL(req.url, "http://x");
+      const l = parseInt(u.searchParams.get("limit"), 10);
+      if (Number.isFinite(l)) limit = Math.max(1, Math.min(100, l));
+      before = u.searchParams.get("before") || null;
+    } catch (_) {}
+
+    const cid = effectiveChainId();
+    const mode = localDev ? "mock" : "chain";
+    let events_, nextCursor, stats;
+
+    if (store.isReady()) {
+      const page = await store.queryHistory(cid, limit, before);
+      events_ = page ? page.events : [];
+      nextCursor = page ? page.nextCursor : null;
+      stats = await store.queryStats(cid, 200);
+    } else {
+      // In-memory fallback: degenerate offset cursor ("mem:<n>") over the Map.
+      const all = memoryHistoryList();
+      let offset = 0;
+      if (before && before.startsWith("mem:")) {
+        const o = parseInt(before.slice(4), 10);
+        if (Number.isFinite(o) && o > 0) offset = o;
+      }
+      const slice = all.slice(offset, offset + limit);
+      events_ = slice;
+      nextCursor = offset + limit < all.length ? "mem:" + (offset + limit) : null;
+      stats = computeStatsFromMemory(200);
+    }
+
+    if (stats) stats.mode = mode;
+    sendJson(req, res, { events: events_, nextCursor, stats, mode });
+  }
+
   function handleRequest(req, res, pathname) {
     if (pathname === "/__echo/state" && (req.method === "GET" || req.method === "HEAD")) {
-      const body = JSON.stringify(getStateResponse());
-      const headers = {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-      };
-      if (req.method === "HEAD") {
-        res.writeHead(200, { ...headers, "content-length": Buffer.byteLength(body) });
-        res.end();
-        return true;
-      }
-      res.writeHead(200, headers);
-      res.end(body);
+      sendJson(req, res, getStateResponse());
+      return true;
+    }
+    if (pathname === "/__echo/history" && (req.method === "GET" || req.method === "HEAD")) {
+      handleHistory(req, res).catch((e) => {
+        console.error("[echo] history error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "history unavailable" }));
+        }
+      });
       return true;
     }
     return false;
@@ -699,10 +898,57 @@ function createEcho(opts) {
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
+  // Build an inert in-memory event from a durable row (no timers, no resend).
+  function hydratedEvent(r) {
+    return {
+      requestTxId: r.requestTxId,
+      requestFrom: r.requestFrom,
+      requestAmount: r.requestAmount,
+      requestTs: r.requestTs != null ? r.requestTs : Date.now(),
+      requestSeenAtServerMs: r.requestSeenAtServerMs,
+      requestBlockHeight: r.requestBlockHeight,
+      requestBlockHash: r.requestBlockHash,
+      echoAmount: r.echoAmount,
+      echoSentAtServerMs: r.echoSentAtServerMs,
+      echoTxId: r.echoTxId,
+      echoConfirmedTs: r.echoConfirmedTs,
+      echoConfirmedAtServerMs: r.echoConfirmedAtServerMs,
+      echoBlockHeight: r.echoBlockHeight,
+      echoBlockHash: r.echoBlockHash,
+      error: r.error,
+      errorCategory: r.errorCategory,
+      nextRetryAtMs: null,
+      status: r.status,
+      retryAttempts: r.retryAttempts || 0,
+      _inclusionTimer: null,
+    };
+  }
+
   function start() {
     // Chain plumbing (live polling, backfill, mock-drain) is owned by the
     // surrounding createAppStateCache wiring in server.js. We only do
     // app-specific tasks here.
+    (async () => {
+      await store.init();
+      // Warm the in-memory Map from the durable log so /__echo/state and the
+      // history endpoint aren't empty right after a restart. Inert: no timers,
+      // no re-sends. handleIncoming/handleOutgoing short-circuit on
+      // events.has(), so backfill replay won't re-echo a hydrated request.
+      try {
+        const rows = await store.hydrate(effectiveChainId(), MAX_EVENTS);
+        let n = 0;
+        for (const r of rows) {
+          if (!r.requestTxId || events.has(r.requestTxId)) continue;
+          events.set(r.requestTxId, hydratedEvent(r));
+          n++;
+        }
+        if (n) console.log(`[echo] hydrated ${n} events from durable log (chain=${effectiveChainId()})`);
+        trimEvents();
+      } catch (e) {
+        console.error("[echo] hydrate failed:", e.message);
+      }
+    })();
+
     if (!localDev) {
       // Pre-warm sidecar registration so the first echo is fast. Retry quietly
       // in the background — the sidecar may need time to come online.
@@ -742,6 +988,7 @@ function createEcho(opts) {
     getPending,
     start,
     reset,
+    setChainId,
     appPubkey,
   };
 }
