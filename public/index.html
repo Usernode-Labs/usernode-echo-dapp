@@ -19,39 +19,34 @@
   <meta name="x-app-version" content="__BUILD_VERSION__" />
   <style>
     *, *::before, *::after { box-sizing: border-box; }
+    /* Dark theme with a single vibrant violet accent. Tokens drive the
+       whole UI — buttons, links, chips, highlights, and active states all
+       resolve back to --accent / --accent-text for one cohesive look. */
     :root {
-      color-scheme: light dark;
-      --bg: #f7f8fb;
-      --fg: #0b1220;
-      --muted: #4b5568;
-      --card: #ffffff;
-      --border: rgba(15, 23, 42, 0.12);
-      --accent: #2563eb;
-      --ok: #0f766e;
-      --warn: #ca8a04;
-      --err: #c81e1e;
-      --chip-bg: rgba(37, 99, 235, 0.08);
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #0b0f16;
-        --fg: #e7edf7;
-        --muted: #a8b3c7;
-        --card: #141b26;
-        --border: rgba(255, 255, 255, 0.12);
-        --accent: #6ea8fe;
-        --ok: #5dd39e;
-        --warn: #e6a817;
-        --err: #ff6b6b;
-        --chip-bg: rgba(110, 168, 254, 0.12);
-      }
+      color-scheme: dark;
+      --bg: #0b0d17;
+      --fg: #e9ebf5;
+      --muted: #9aa1ba;
+      --card: #151a2b;
+      --border: rgba(255, 255, 255, 0.10);
+      --accent: #7c3aed;        /* button / fill surfaces (white text on top) */
+      --accent-hover: #8b54f0;
+      --accent-text: #a78bfa;   /* accent as text/links on dark (readable) */
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --err: #fb7185;
+      --chip-bg: rgba(139, 92, 246, 0.16);
     }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     body {
       margin: 0;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
         Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      background: var(--bg); color: var(--fg);
+      /* Subtle violet glow at the top freshens the flat dark surface. */
+      background:
+        radial-gradient(1100px 520px at 50% -12%, rgba(124, 58, 237, 0.16), transparent 62%),
+        var(--bg);
+      color: var(--fg);
       display: flex; flex-direction: column;
       height: 100vh; height: 100dvh; overflow: hidden;
     }
@@ -59,7 +54,9 @@
       flex: 0 0 auto;
       padding: 12px 16px;
       border-bottom: 1px solid var(--border);
-      background: var(--card);
+      background: rgba(21, 26, 43, 0.72);
+      backdrop-filter: saturate(140%) blur(8px);
+      -webkit-backdrop-filter: saturate(140%) blur(8px);
     }
     .topBar-inner {
       max-width: 720px; margin: 0 auto;
@@ -70,8 +67,8 @@
     .modePill {
       font-size: 11px; font-weight: 600;
       padding: 3px 10px; border-radius: 999px;
-      background: var(--chip-bg); color: var(--accent);
-      border: 1px solid var(--border);
+      background: var(--chip-bg); color: var(--accent-text);
+      border: 1px solid rgba(139, 92, 246, 0.30);
       display: inline-block; text-align: center;
       white-space: nowrap; flex-shrink: 0;
     }
@@ -94,20 +91,24 @@
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 14px;
       padding: 16px;
       margin-bottom: 16px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
     }
     h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
     label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     input[type="number"] {
       width: 100%; padding: 10px 12px;
       font-size: 16px; font-family: inherit;
-      background: transparent; color: var(--fg);
+      background: rgba(255, 255, 255, 0.03); color: var(--fg);
       border: 1px solid var(--border); border-radius: 8px;
       -webkit-appearance: none; appearance: none;
     }
-    input[type="number"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    input[type="number"]:focus {
+      outline: 2px solid var(--accent-text); outline-offset: -1px;
+      border-color: transparent;
+    }
     .row { display: flex; gap: 10px; align-items: stretch; }
     .row > * { flex: 1 1 auto; }
     button.primary {
@@ -118,8 +119,15 @@
       background: var(--accent); color: #fff;
       border: 0; border-radius: 8px;
       cursor: pointer;
+      box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);
+      transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
     }
-    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      box-shadow: 0 6px 18px rgba(124, 58, 237, 0.45);
+    }
+    button.primary:active:not(:disabled) { transform: translateY(1px); }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
     /* Amount field + inline "Max" control. The wrapper is the flex child
        (so Send still sits beside it via .row); the input fills the wrapper
        and reserves right padding so typed digits never slide under Max. */
@@ -207,13 +215,13 @@
       display: inline-block; padding: 2px 8px; border-radius: 999px;
       font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     }
-    .status.sending  { background: var(--chip-bg); color: var(--accent); }
-    .status.checking { background: var(--chip-bg); color: var(--accent); }
-    .status.pending  { background: var(--chip-bg); color: var(--accent); }
-    .status.echoing  { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
-    .status.confirmed { background: rgba(15, 118, 110, 0.15); color: var(--ok); }
+    .status.sending  { background: var(--chip-bg); color: var(--accent-text); }
+    .status.checking { background: var(--chip-bg); color: var(--accent-text); }
+    .status.pending  { background: var(--chip-bg); color: var(--accent-text); }
+    .status.echoing  { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+    .status.confirmed { background: rgba(52, 211, 153, 0.16); color: var(--ok); }
     .status.skipped  { background: var(--border); color: var(--muted); }
-    .status.failed   { background: rgba(200, 30, 30, 0.15); color: var(--err); }
+    .status.failed   { background: rgba(251, 113, 133, 0.16); color: var(--err); }
     .status.retrying { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
 
     /* Retry / message / error-detail lines on the latest card */
@@ -351,8 +359,8 @@
       display: inline-flex; align-items: center; gap: 4px;
       font-size: 11px; font-variant-numeric: tabular-nums;
       padding: 2px 8px; border-radius: 999px;
-      background: var(--chip-bg); color: var(--accent);
-      border: 1px solid var(--border);
+      background: var(--chip-bg); color: var(--accent-text);
+      border: 1px solid rgba(139, 92, 246, 0.30);
       text-decoration: none; line-height: 1.5;
     }
     .block-chip:hover, .block-chip:focus { text-decoration: underline; }
