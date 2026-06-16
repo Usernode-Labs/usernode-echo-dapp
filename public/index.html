@@ -406,6 +406,32 @@
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
+    /* Leaderboard card */
+    .lb-row {
+      display: grid;
+      grid-template-columns: 28px 1fr auto auto;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 4px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .lb-row:last-child { border-bottom: none; }
+    .lb-row-self {
+      background: rgba(124, 58, 237, 0.10);
+      border-radius: 6px;
+      border-bottom-color: transparent;
+      margin-bottom: 1px;
+    }
+    .lb-rank {
+      font-size: 11px; font-weight: 700;
+      color: var(--muted); text-align: center;
+    }
+    .lb-rank-top { color: var(--accent-text); }
+    .lb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
+    .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
       padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -537,6 +563,16 @@
         </div>
       </div>
 
+      <!-- Latency Over Time chart (median round-trip per hour) -->
+      <div class="card" id="latencyCard" style="display:none">
+        <h2>Latency Over Time</h2>
+        <div class="section-sub">Last 24 h · median round-trip · hourly</div>
+        <div id="latencyNoData" class="history-empty" style="display:none">No data yet</div>
+        <div id="latencyChartWrap" style="position:relative;height:200px;display:none">
+          <canvas id="latencyChart"></canvas>
+        </div>
+      </div>
+
       <!-- Most recent attempt -->
       <div class="card" id="latestCard" style="display:none">
         <h2>Latest attempt <span class="status" id="latestStatus">pending</span><span class="auto-refresh-dot" id="autoRefreshDot" style="display:none"></span></h2>
@@ -614,6 +650,13 @@
           </div>
         </div>
         <div class="diag-meta" id="yourStatsMeta"></div>
+      </div>
+
+      <!-- Leaderboard — top senders ranked by confirmed tokens echoed -->
+      <div class="card" id="leaderboardCard" style="display:none">
+        <h2>Leaderboard</h2>
+        <div class="section-sub">Top senders on the current chain.</div>
+        <div id="leaderboard"></div>
       </div>
 
       <!-- Your attempts (per-device, localStorage) -->
@@ -2348,6 +2391,68 @@
       } catch (_) { /* ignore — next tick retries */ }
     }
 
+    /* ── Leaderboard ─────────────────────────────────────────── */
+    function renderLeaderboard(entries) {
+      const card = document.getElementById("leaderboardCard");
+      const el   = document.getElementById("leaderboard");
+      if (!card || !el) return;
+      card.style.display = "block";
+      el.innerHTML = "";
+      if (!entries || entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "No echoes recorded yet.";
+        el.appendChild(empty);
+        return;
+      }
+      entries.forEach((entry, idx) => {
+        const rank = idx + 1;
+        const isSelf = myStatsAddress && entry.address === myStatsAddress;
+        const name = (UsernodeUsernames && UsernodeUsernames.getUsernameSync)
+          ? (UsernodeUsernames.getUsernameSync(entry.address) || ("…" + entry.address.slice(-8)))
+          : ("…" + entry.address.slice(-8));
+        const row = document.createElement("div");
+        row.className = "lb-row" + (isSelf ? " lb-row-self" : "");
+
+        const rankEl = document.createElement("div");
+        rankEl.className = "lb-rank" + (rank <= 3 ? " lb-rank-top" : "");
+        rankEl.textContent = rank;
+
+        const nameEl = document.createElement("div");
+        nameEl.className = "lb-name";
+        nameEl.textContent = name;
+        if (isSelf) nameEl.style.color = "var(--accent-text)";
+
+        const tokensEl = document.createElement("div");
+        tokensEl.className = "lb-tokens";
+        tokensEl.textContent = entry.tokensSent.toLocaleString() + " tok";
+
+        const echoesEl = document.createElement("div");
+        echoesEl.className = "lb-echoes";
+        echoesEl.textContent = entry.echoCount + "×";
+
+        row.appendChild(rankEl);
+        row.appendChild(nameEl);
+        row.appendChild(tokensEl);
+        row.appendChild(echoesEl);
+        el.appendChild(row);
+      });
+    }
+
+    async function pollLeaderboard() {
+      try {
+        const r = await fetch("/__echo/leaderboard", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.entries)) {
+          renderLeaderboard(data.entries);
+        }
+      } catch (_) {}
+    }
+
     /* ── Success Rate Over Time chart ────────────────────────── */
     let successRateChart = null;
     let _successRateMeta = []; // parallel array to chart data slots (null = empty hour)
@@ -2468,8 +2573,122 @@
         const data = await r.json();
         if (data && Array.isArray(data.buckets)) {
           updateSuccessRateChart(data.buckets);
+          updateLatencyChart(data.buckets);
         }
       } catch (_) {}
+    }
+
+    /* ── Latency Over Time chart ─────────────────────────────── */
+    let latencyChart = null;
+    let _latencyMeta = [];
+
+    function initLatencyChart() {
+      const canvas = document.getElementById("latencyChart");
+      if (!canvas || !window.Chart) return null;
+      const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const gridColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)";
+      const tickColor = isDark ? "#a8b3c7" : "#4b5568";
+      return new window.Chart(canvas, {
+        type: "bar",
+        data: {
+          labels: [],
+          datasets: [{
+            data: [],
+            backgroundColor: (ctx) => {
+              const v = ctx.raw;
+              if (v == null) return "transparent";
+              if (v < 2000)  return "rgba(52,211,153,0.75)";
+              if (v < 5000)  return "rgba(251,191,36,0.75)";
+              return "rgba(251,113,133,0.75)";
+            },
+            borderRadius: 4,
+            borderSkipped: false,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                label: (item) => {
+                  const b = _latencyMeta[item.dataIndex];
+                  if (!b || b.medianLatencyMs == null) return "No data";
+                  return fmtMs(b.medianLatencyMs) + " median · " + (b.confirmed || 0) + " echoes";
+                },
+              },
+            },
+          },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: {
+                color: tickColor, font: { size: 11 }, maxRotation: 0,
+                maxTicksLimit: 8,
+              },
+            },
+            y: {
+              ticks: {
+                color: tickColor,
+                font: { size: 11 },
+                callback: (v) => fmtMs(v),
+              },
+              grid: { color: gridColor },
+            },
+          },
+        },
+      });
+    }
+
+    function updateLatencyChart(buckets) {
+      const card   = document.getElementById("latencyCard");
+      const noData = document.getElementById("latencyNoData");
+      const wrap   = document.getElementById("latencyChartWrap");
+      if (!card) return;
+
+      card.style.display = "block";
+
+      const now = new Date();
+      now.setUTCMinutes(0, 0, 0);
+
+      const bucketMap = new Map();
+      for (const b of buckets) bucketMap.set(b.hourStart.slice(0, 13), b);
+
+      const labels = [];
+      const data   = [];
+      _latencyMeta = [];
+      let hasData  = false;
+
+      for (let i = 23; i >= 0; i--) {
+        const slot = new Date(now.getTime() - i * 3_600_000);
+        const key  = slot.toISOString().slice(0, 13);
+        labels.push(slot.getHours().toString().padStart(2, "0") + ":00");
+        const b = bucketMap.get(key) || null;
+        const lat = b ? b.medianLatencyMs : null;
+        data.push(lat);
+        _latencyMeta.push(b);
+        if (lat != null) hasData = true;
+      }
+
+      if (!hasData) {
+        if (noData) noData.style.display = "block";
+        if (wrap)   wrap.style.display   = "none";
+        return;
+      }
+
+      if (noData) noData.style.display = "none";
+      if (wrap)   wrap.style.display   = "block";
+
+      if (!latencyChart) {
+        latencyChart = initLatencyChart();
+        if (!latencyChart) return;
+      }
+
+      latencyChart.data.labels           = labels;
+      latencyChart.data.datasets[0].data = data;
+      latencyChart.update("none");
     }
 
     async function fetchHistoryPage(before) {
@@ -2878,6 +3097,10 @@
       // Success-rate chart: same cadence as the history poll.
       fetchSuccessRate();
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
+
+      // Leaderboard: initial fetch + 30s auto-refresh.
+      pollLeaderboard();
+      setInterval(pollLeaderboard, 30000);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).

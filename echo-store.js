@@ -535,7 +535,10 @@ function createEchoStore(opts = {}) {
         date_trunc('hour', created_at) AS hour_start,
         COUNT(*) FILTER (WHERE status = 'confirmed')::int AS confirmed,
         COUNT(*) FILTER (WHERE status = 'failed')::int    AS failed,
-        COUNT(*) FILTER (WHERE status = 'skipped')::int   AS skipped
+        COUNT(*) FILTER (WHERE status = 'skipped')::int   AS skipped,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY GREATEST(echo_confirmed_ts - request_ts, 0))
+          FILTER (WHERE status = 'confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL)
+          AS median_latency_ms
       FROM echo_events
       WHERE chain_id IS NOT DISTINCT FROM $1
         AND status IN ('confirmed', 'failed', 'skipped')
@@ -561,11 +564,45 @@ function createEchoStore(opts = {}) {
           total,
           // Percentage 0-100 (null when no settled events in the bucket).
           successRate: total > 0 ? Math.round((confirmed / total) * 1000) / 10 : null,
+          medianLatencyMs: numOrNull(row.median_latency_ms),
         };
       });
     } catch (e) {
       console.error("[echo-store] getSuccessRateBuckets error:", e.message);
       return null;
+    }
+  }
+
+  // Top senders ranked by total confirmed tokens. Returns [] when disabled.
+  async function queryLeaderboard(chainId, limit = 20) {
+    if (!isReady()) return [];
+    const lim = Math.max(1, Math.min(100, limit || 20));
+    const sql = `
+      SELECT
+        request_from AS address,
+        SUM(request_amount) FILTER (WHERE status = 'confirmed')::bigint AS tokens_sent,
+        COUNT(*) FILTER (WHERE status = 'confirmed')::int AS echo_count,
+        AVG(GREATEST(echo_confirmed_ts - request_ts, 0))
+          FILTER (WHERE status = 'confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL)
+          AS avg_latency_ms
+      FROM echo_events
+      WHERE chain_id IS NOT DISTINCT FROM $1
+      GROUP BY request_from
+      HAVING COUNT(*) FILTER (WHERE status = 'confirmed') > 0
+      ORDER BY tokens_sent DESC
+      LIMIT $2
+    `;
+    try {
+      const r = await pool.query(sql, [chainId || null, lim]);
+      return r.rows.map((row) => ({
+        address: row.address,
+        tokensSent: numOrNull(row.tokens_sent) || 0,
+        echoCount: row.echo_count || 0,
+        avgLatencyMs: numOrNull(row.avg_latency_ms),
+      }));
+    } catch (e) {
+      console.error("[echo-store] queryLeaderboard error:", e.message);
+      return [];
     }
   }
 
@@ -718,6 +755,69 @@ function createEchoStore(opts = {}) {
       }
     }
     if (seeded > 0) console.log(`[echo-store] seeded ${seeded} staging demo rows (chain=${chainId})`);
+
+    // Leaderboard demo rows — 8 distinct fake senders with varied confirmed
+    // echo counts and amounts so the leaderboard renders a meaningful ranking.
+    // DEMO_STATS_PUBKEY is included so a ?demo=1 tester appears in the top 20.
+    const DEMO_STATS_PUBKEY =
+      "ut1stagingdemoecho000000000000000000000000000000000000000demo0";
+    const LB_SENDERS = [
+      { suffix: "a", count: 18, amount: 20 },
+      { suffix: "b", count: 14, amount: 15 },
+      { suffix: "c", count: 10, amount: 12 },
+      { suffix: "d", count:  8, amount: 10 },
+      { suffix: "e", count:  7, amount:  8 },
+      { suffix: "f", count:  5, amount:  5 },
+      { suffix: "g", count:  4, amount:  3 },
+      { suffix: "h", count:  3, amount:  2 },
+    ];
+    const LB_BASE = BASE + 3_600_000; // offset from the history demo rows
+    let lbSeeded = 0;
+    for (const s of LB_SENDERS) {
+      const addr = `ut1lbdemo${s.suffix}0000000000000000000000000000000000000000000`;
+      for (let i = 0; i < s.count; i++) {
+        const reqTs = LB_BASE + (s.suffix.charCodeAt(0) * 100_000) + i * 60_000;
+        const echoTs = reqTs + 30_000;
+        const txId = `staging-lb-${s.suffix}-${String(i).padStart(3, "0")}`;
+        try {
+          const { rowCount } = await pool.query(
+            `INSERT INTO echo_events
+               (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+                status, request_ts, request_seen_at_ms,
+                echo_confirmed_ts, echo_confirmed_at_ms, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$8,$9,$9)
+             ON CONFLICT (request_tx_id) DO NOTHING`,
+            [txId, chainId || null, addr, s.amount, s.amount - 1, "confirmed",
+             reqTs, echoTs, new Date(reqTs)]
+          );
+          lbSeeded += rowCount || 0;
+        } catch (e) {
+          console.warn("[echo-store] lb seed row failed:", e.message);
+        }
+      }
+    }
+    // DEMO_STATS_PUBKEY: 12 confirmed echoes so it ranks in the top 20.
+    for (let i = 0; i < 12; i++) {
+      const reqTs = LB_BASE + 5_000_000 + i * 60_000;
+      const echoTs = reqTs + 30_000;
+      const txId = `staging-lb-demo-${String(i).padStart(3, "0")}`;
+      try {
+        const { rowCount } = await pool.query(
+          `INSERT INTO echo_events
+             (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+              status, request_ts, request_seen_at_ms,
+              echo_confirmed_ts, echo_confirmed_at_ms, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$8,$9,$9)
+           ON CONFLICT (request_tx_id) DO NOTHING`,
+          [txId, chainId || null, DEMO_STATS_PUBKEY, 7, 6, "confirmed",
+           reqTs, echoTs, new Date(reqTs)]
+        );
+        lbSeeded += rowCount || 0;
+      } catch (e) {
+        console.warn("[echo-store] lb demo seed row failed:", e.message);
+      }
+    }
+    if (lbSeeded > 0) console.log(`[echo-store] seeded ${lbSeeded} staging leaderboard demo rows`);
   }
 
   async function close() {
@@ -728,7 +828,7 @@ function createEchoStore(opts = {}) {
   }
 
   return { init, isReady, persist, hydrate, queryHistory, queryStats,
-           getLeaderboard, queryUserStats, getSuccessRateBuckets,
+           getLeaderboard, queryUserStats, getSuccessRateBuckets, queryLeaderboard,
            seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
 }
 
