@@ -119,6 +119,7 @@
       background: var(--accent); color: #fff;
       border: 0; border-radius: 8px;
       cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
       box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);
       transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
     }
@@ -127,7 +128,27 @@
       box-shadow: 0 6px 18px rgba(124, 58, 237, 0.45);
     }
     button.primary:active:not(:disabled) { transform: translateY(1px); }
+    button.primary:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
+    /* In-flight loading state: a small spinning ring sits inline before the
+       label, which switches to "Sending…" (driven by setSending in JS). */
+    .btn-spinner {
+      display: none;
+      width: 14px; height: 14px; flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: btnSpin 0.7s linear infinite;
+    }
+    button.primary.is-sending .btn-spinner { display: inline-block; }
+    @keyframes btnSpin {
+      to { transform: rotate(360deg); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .btn-spinner { animation: none; }
+    }
     /* Amount field + inline "Max" control. The wrapper is the flex child
        (so Send still sits beside it via .row); the input fills the wrapper
        and reserves right padding so typed digits never slide under Max. */
@@ -476,7 +497,7 @@
             <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
             <button id="maxBtn" type="button" class="max-btn" aria-label="Use full available balance">Max</button>
           </div>
-          <button id="sendBtn" class="primary">Send</button>
+          <button id="sendBtn" class="primary" aria-busy="false"><span class="btn-spinner" aria-hidden="true"></span><span id="sendBtnLabel">Send</span></button>
         </div>
         <div class="hint" id="maxHint" style="display:none"></div>
         <div class="tx-progress hide" id="txProgress">
@@ -563,6 +584,36 @@
              server string is kept below it as a muted monospace detail. -->
         <div class="latest-msg" id="latestMsg" style="display:none"></div>
         <div class="err-detail" id="latestErrDetail" style="display:none"></div>
+      </div>
+
+      <!-- Your stats — per-user aggregate from /__echo/my-stats, scoped to
+           the signed-in wallet (survives across devices). -->
+      <div class="card" id="yourStatsCard">
+        <h2>Your stats</h2>
+        <div class="section-sub">This wallet's echoes — across every device.</div>
+        <div class="diag-grid">
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsTotal">—</div>
+            <div class="diag-label">Total echoes</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsSuccess">—</div>
+            <div class="diag-label">Success rate</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsAvg">—</div>
+            <div class="diag-label">Avg round-trip</div>
+          </div>
+        </div>
+        <div class="timing-section">
+          <div class="timing">
+            <div class="label">Fastest round-trip</div>
+            <div class="val" id="yourStatsMin">—</div>
+            <div class="label">Slowest round-trip</div>
+            <div class="val" id="yourStatsMax">—</div>
+          </div>
+        </div>
+        <div class="diag-meta" id="yourStatsMeta"></div>
       </div>
 
       <!-- Your attempts (per-device, localStorage) -->
@@ -687,6 +738,19 @@
     const LEADERBOARD_POLL_MS = 60000;
     const GLOBAL_LOG_PAGE = 25;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
+
+    // "Your stats" (per-user aggregate) config. In staging the page can be
+    // opened with ?demo=1, which switches the stats lookup to a fixed demo
+    // wallet the server seeds (echo-logic.js DEMO_STATS_PUBKEY) so a tester
+    // sees populated numbers regardless of which wallet they're signed in as.
+    const DEMO_STATS_PUBKEY =
+      "ut1stagingdemoecho000000000000000000000000000000000000000demo0";
+    const IS_DEMO = (() => {
+      try { return new URLSearchParams(window.location.search).get("demo") === "1"; }
+      catch (_) { return false; }
+    })();
+    // Resolved once: the wallet address we render "Your stats" for.
+    let myStatsAddress = null;
 
     /* Map raw sidecar/server error strings to a short human explanation.
        The raw string is still shown as a muted detail line. */
@@ -1034,6 +1098,7 @@
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
+    const sendBtnLabel = document.getElementById("sendBtnLabel");
     const maxBtn = document.getElementById("maxBtn");
     const maxHint = document.getElementById("maxHint");
     const errMsg = document.getElementById("errMsg");
@@ -1068,6 +1133,12 @@
     const diagMedian = document.getElementById("diagMedian");
     const diagP95 = document.getElementById("diagP95");
     const diagMeta = document.getElementById("diagMeta");
+    const yourStatsTotal = document.getElementById("yourStatsTotal");
+    const yourStatsSuccess = document.getElementById("yourStatsSuccess");
+    const yourStatsAvg = document.getElementById("yourStatsAvg");
+    const yourStatsMin = document.getElementById("yourStatsMin");
+    const yourStatsMax = document.getElementById("yourStatsMax");
+    const yourStatsMeta = document.getElementById("yourStatsMeta");
 
     appPubkeyText.textContent = shortPk(APP_PUBKEY);
 
@@ -1382,6 +1453,12 @@
       sending = !!v;
       amountInput.disabled = !!v;
       sendBtn.disabled = !!v;
+      // Drive the button's own presentation from the single source of truth so
+      // it inherits the call-site / generation guarding for free: busy spinner
+      // + "Sending…" label while in flight, back to "Send" on resolve.
+      sendBtn.classList.toggle("is-sending", !!v);
+      sendBtn.setAttribute("aria-busy", v ? "true" : "false");
+      if (sendBtnLabel) sendBtnLabel.textContent = v ? "Sending…" : "Send";
       if (maxBtn) maxBtn.disabled = !!v;
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
@@ -2205,6 +2282,72 @@
       diagMeta.textContent = bits.join(" · ");
     }
 
+    /* ── Your stats (per-user aggregate) ──────────────────────
+       Scoped to the signed-in wallet via /__echo/my-stats. Unlike the
+       global Diagnostics card, these numbers count only this wallet's
+       echoes, and unlike "Your attempts" (localStorage) they reflect the
+       server's durable record across devices. */
+    function renderUserStats(stats, haveAddress) {
+      if (!haveAddress) {
+        yourStatsTotal.textContent = "—";
+        yourStatsSuccess.textContent = "—";
+        yourStatsAvg.textContent = "—";
+        yourStatsMin.textContent = "—";
+        yourStatsMax.textContent = "—";
+        yourStatsMeta.textContent = "Connect your wallet to see your stats.";
+        return;
+      }
+      const total = stats && stats.total != null ? stats.total : 0;
+      const confirmed = stats && stats.confirmed != null ? stats.confirmed : 0;
+      yourStatsTotal.textContent = String(total);
+      yourStatsSuccess.textContent = (stats && stats.successRate != null)
+        ? Math.round(stats.successRate * 100) + "%" : "—";
+      // Latency is only defined once at least one echo has confirmed.
+      const haveLat = confirmed > 0;
+      yourStatsAvg.textContent = (haveLat && stats.avgTotalMs != null) ? fmtMs(stats.avgTotalMs) : "—";
+      yourStatsMin.textContent = (haveLat && stats.minTotalMs != null) ? fmtMs(stats.minTotalMs) : "—";
+      yourStatsMax.textContent = (haveLat && stats.maxTotalMs != null) ? fmtMs(stats.maxTotalMs) : "—";
+      if (total === 0) {
+        yourStatsMeta.textContent = "Send your first echo to see your stats.";
+        return;
+      }
+      const bits = [confirmed + " ok"];
+      if (stats.failed) bits.push(stats.failed + " failed");
+      if (stats.skipped) bits.push(stats.skipped + " skipped");
+      if (stats.inFlight) bits.push(stats.inFlight + " in flight");
+      bits.push("your wallet only");
+      yourStatsMeta.textContent = bits.join(" · ");
+    }
+
+    // Resolve the signed-in wallet address once (demo override → bridge).
+    async function resolveMyStatsAddress() {
+      if (IS_DEMO) return DEMO_STATS_PUBKEY;
+      try {
+        if (typeof window.getNodeAddress === "function") {
+          const a = await window.getNodeAddress();
+          if (a) return a;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    async function pollUserStats() {
+      if (!myStatsAddress) myStatsAddress = await resolveMyStatsAddress();
+      if (!myStatsAddress) { renderUserStats(null, false); return; }
+      try {
+        const params = new URLSearchParams();
+        params.set("address", myStatsAddress);
+        if (IS_DEMO) params.set("demo", "1");
+        const r = await fetch("/__echo/my-stats?" + params.toString(), {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        renderUserStats(data, true);
+      } catch (_) { /* ignore — next tick retries */ }
+    }
+
     /* ── Success Rate Over Time chart ────────────────────────── */
     let successRateChart = null;
     let _successRateMeta = []; // parallel array to chart data slots (null = empty hour)
@@ -2726,6 +2869,11 @@
       // Leaderboard: initial fetch, then slow refresh.
       refreshLeaderboard();
       setInterval(refreshLeaderboard, LEADERBOARD_POLL_MS);
+
+      // Your stats: initial fetch + slow auto-refresh on the same cadence.
+      renderUserStats(null, false);
+      pollUserStats();
+      setInterval(pollUserStats, HISTORY_POLL_MS);
 
       // Success-rate chart: same cadence as the history poll.
       fetchSuccessRate();
