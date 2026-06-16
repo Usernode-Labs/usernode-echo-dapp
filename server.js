@@ -300,6 +300,9 @@ app.use(express.static(PUBLIC_DIR, {
 //                             https://testnet-explorer.usernodelabs.org)
 //                             so the dapp can link "Block #N" chips to
 //                             /blocks/<height> on the explorer SPA.
+//   __ECHO_IS_STAGING__     — "true" in a staging container, else "false".
+//                             Gates the Max button's ?demo=1 balance override
+//                             so production can never inject a fake balance.
 let _indexHtmlCache = null;
 let _indexHtmlVersion = null;
 function renderIndexHtml() {
@@ -313,7 +316,9 @@ function renderIndexHtml() {
     }
     _indexHtmlCache = raw
       .split("__BUILD_VERSION__").join(version)
-      .split("__EXPLORER_PUBLIC_BASE__").join(getExplorerPublicBase());
+      .split("__EXPLORER_PUBLIC_BASE__").join(getExplorerPublicBase())
+      // Gates the client's ?demo=1 Max-balance override to staging only.
+      .split("__ECHO_IS_STAGING__").join(IS_STAGING ? "true" : "false");
     _indexHtmlVersion = version;
   }
   return _indexHtmlCache;
