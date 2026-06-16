@@ -71,6 +71,14 @@
       display: inline-block; text-align: center;
       white-space: nowrap; flex-shrink: 0;
     }
+    .healthBanner {
+      font-size: 12px; font-weight: 600;
+      padding: 8px 16px; text-align: center;
+      border-bottom: 1px solid var(--border);
+      color: #92400e; background: #fef3c7;
+    }
+    .healthBanner.critical { color: #7f1d1d; background: #fee2e2; }
+    .healthBanner.hide { display: none; }
     .scrollArea {
       flex: 1 1 auto; overflow-y: auto; min-height: 0;
       padding-bottom: max(16px, env(safe-area-inset-bottom));
@@ -143,7 +151,8 @@
        see *something* is still happening even though chain confirmation can
        take 30-60s and we have no incremental progress signal until the echo
        lands. */
-    .tx-progress-fill.echoing {
+    .tx-progress-fill.echoing,
+    .tx-progress-fill.retrying {
       background:
         repeating-linear-gradient(
           -45deg,
@@ -195,6 +204,47 @@
     .status.confirmed { background: rgba(52, 211, 153, 0.16); color: var(--ok); }
     .status.skipped  { background: var(--border); color: var(--muted); }
     .status.failed   { background: rgba(251, 113, 133, 0.16); color: var(--err); }
+    .status.retrying { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
+
+    /* Retry / message / error-detail lines on the latest card */
+    .retry-line {
+      margin-top: 10px; font-size: 12px; color: var(--warn);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .retry-line .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; flex: 0 0 auto;
+      animation: echoPulse 1.4s ease-in-out infinite;
+    }
+    .latest-msg { margin-top: 10px; font-size: 13px; line-height: 1.4; }
+    .latest-msg.skip { color: var(--muted); }
+    .latest-msg.failed { color: var(--err); }
+    .latest-msg.transient { color: var(--warn); }
+    .err-detail {
+      margin-top: 6px; font-size: 11px; color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-word;
+    }
+
+    /* Diagnostics strip (global aggregate stats) */
+    .diag-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .diag-cell { text-align: center; padding: 4px; }
+    .diag-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .diag-label {
+      font-size: 10px; color: var(--muted); margin-top: 2px;
+      text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .diag-meta { margin-top: 10px; font-size: 11px; color: var(--muted); text-align: center; }
+
+    /* Global echo log */
+    .section-sub { font-size: 11px; color: var(--muted); margin: -4px 0 10px; }
+    .load-more {
+      display: block; width: 100%; margin-top: 12px;
+      padding: 9px 12px; font-size: 13px; font-weight: 600;
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+    }
+    .load-more:disabled { opacity: 0.5; cursor: default; }
 
     @keyframes echoPulse {
       0%, 100% { opacity: 1; }
@@ -264,6 +314,11 @@
     </div>
   </div>
 
+  <!-- Service-health banner. Hidden unless the server reports degraded health
+       (driven by state.health from /__echo/state). Non-alarming, no detail —
+       just enough to tell the user "it's the service, not your phone". -->
+  <div class="healthBanner hide" id="healthBanner" role="status"></div>
+
   <div class="scrollArea">
     <main>
       <!-- Send form -->
@@ -279,6 +334,26 @@
           <div class="tx-progress-label">Sending...</div>
         </div>
         <div class="hint" id="errMsg" style="display:none"></div>
+      </div>
+
+      <!-- Diagnostics — global aggregate stats from /__echo/history -->
+      <div class="card" id="diagCard" style="display:none">
+        <h2>Diagnostics</h2>
+        <div class="diag-grid">
+          <div class="diag-cell">
+            <div class="diag-val" id="diagSuccess">—</div>
+            <div class="diag-label">Success rate</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="diagMedian">—</div>
+            <div class="diag-label">Median round-trip</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="diagP95">—</div>
+            <div class="diag-label">p95 round-trip</div>
+          </div>
+        </div>
+        <div class="diag-meta" id="diagMeta"></div>
       </div>
 
       <!-- Most recent attempt -->
@@ -319,13 +394,30 @@
              request/echo block heights become known; hidden otherwise. -->
         <div class="block-chips" id="latestBlocks" style="display:none"></div>
 
-        <div class="hint err" id="latestError" style="display:none"></div>
+        <!-- Transient-retry indicator: "Retrying… (attempt 3/30, next in 42s)" -->
+        <div class="retry-line" id="latestRetry" style="display:none">
+          <span class="dot"></span><span id="latestRetryText"></span>
+        </div>
+
+        <!-- Friendly outcome message (skip / failed / transient). The raw
+             server string is kept below it as a muted monospace detail. -->
+        <div class="latest-msg" id="latestMsg" style="display:none"></div>
+        <div class="err-detail" id="latestErrDetail" style="display:none"></div>
       </div>
 
-      <!-- History -->
+      <!-- Your attempts (per-device, localStorage) -->
       <div class="card">
-        <h2>Recent attempts</h2>
+        <h2>Your attempts</h2>
+        <div class="section-sub">Saved on this device only.</div>
         <div id="history"></div>
+      </div>
+
+      <!-- Global echo log (durable, server-side, shared by all viewers) -->
+      <div class="card">
+        <h2>Global echo log</h2>
+        <div class="section-sub">Recent echoes across every viewer — survives restarts.</div>
+        <div id="globalLog"></div>
+        <button class="load-more" id="loadMoreBtn" style="display:none">Load more</button>
       </div>
 
       <!-- Info -->
@@ -333,6 +425,7 @@
         <h2>How this works</h2>
         <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the sidecar's <code>/wallet/send</code> RPC to return <code>N-1</code> tokens.</p>
         <p>The wall-clock numbers above measure your phone's view of the round-trip; the server-side breakdown shows where the time is going (poll lag → RPC submit → chain confirmation).</p>
+        <p>The <strong>Global echo log</strong> is a shared, public diagnostic feed recorded by the server, while <strong>Your attempts</strong> are stored only in this browser on this device.</p>
       </div>
 
       <div class="footer-note">
@@ -396,12 +489,51 @@
     // older versions on startup so stale entries from previous deploys —
     // most painfully, a stuck "echoing" entry whose server-side state is
     // long gone — can't poison the new UI.
-    const STORAGE_VERSION = 2;
+    // v3: entries gained errorCategory / nextRetryAtMs / retryAttempts / errorRaw.
+    const STORAGE_VERSION = 3;
     const HISTORY_KEY_PREFIX = "echo:history:v";
     const HISTORY_KEY = HISTORY_KEY_PREFIX + STORAGE_VERSION;
     const HISTORY_MAX = 20;
     const STATE_POLL_MS = 2000;
+    // Global echo log + diagnostics poll cadence (slower than state poll).
+    const HISTORY_POLL_MS = 5000;
+    const GLOBAL_LOG_PAGE = 25;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
+
+    /* Map raw sidecar/server error strings to a short human explanation.
+       The raw string is still shown as a muted detail line. */
+    function friendlyError(raw) {
+      if (!raw) return null;
+      const s = String(raw);
+      if (/no .*UTXOs?.* for owner|requires a single base-currency UTXO/i.test(s))
+        return "Echo wallet is briefly out of funds — retrying.";
+      if (/no signer configured|signer not configured/i.test(s))
+        return "Echo signer reconnecting — retrying.";
+      if (/tracked owner not registered/i.test(s))
+        return "Echo wallet registering with the node — retrying.";
+      if (/wallet send already pending/i.test(s))
+        return "Another echo is mid-send — retrying.";
+      if (/sidecar not ready/i.test(s))
+        return "Echo backend warming up — retrying.";
+      if (/queued tx not included/i.test(s))
+        return "Echo transaction dropped before inclusion — requeued.";
+      if (/amount must be ≥ 2|amount must be >= 2/i.test(s))
+        return "Amount must be ≥ 2 — the echo returns N-1, so 1 or less leaves nothing to send back.";
+      if (/gave up after/i.test(s))
+        return "Echo failed after several retries.";
+      return s;
+    }
+
+    /* Derived display status for an entry. A transient-retrying entry is
+       shown as "retrying" even though its underlying status is "pending". */
+    function displayStatus(entry) {
+      if (entry && entry.errorCategory === "transient" &&
+          entry.status !== "confirmed" && entry.status !== "failed" &&
+          entry.status !== "skipped") {
+        return "retrying";
+      }
+      return entry ? entry.status : "pending";
+    }
 
     /* ── Standard helpers ─────────────────────────────────── */
     function extractTxId(sendResult) {
@@ -496,6 +628,7 @@
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
+    const healthBanner = document.getElementById("healthBanner");
 
     const latestCard = document.getElementById("latestCard");
     const latestStatus = document.getElementById("latestStatus");
@@ -508,9 +641,19 @@
     const serverPollLag = document.getElementById("serverPollLag");
     const serverEchoQueue = document.getElementById("serverEchoQueue");
     const serverChainRtt = document.getElementById("serverChainRtt");
-    const latestError = document.getElementById("latestError");
+    const latestRetry = document.getElementById("latestRetry");
+    const latestRetryText = document.getElementById("latestRetryText");
+    const latestMsg = document.getElementById("latestMsg");
+    const latestErrDetail = document.getElementById("latestErrDetail");
     const latestBlocks = document.getElementById("latestBlocks");
     const historyEl = document.getElementById("history");
+    const globalLogEl = document.getElementById("globalLog");
+    const loadMoreBtn = document.getElementById("loadMoreBtn");
+    const diagCard = document.getElementById("diagCard");
+    const diagSuccess = document.getElementById("diagSuccess");
+    const diagMedian = document.getElementById("diagMedian");
+    const diagP95 = document.getElementById("diagP95");
+    const diagMeta = document.getElementById("diagMeta");
 
     appPubkeyText.textContent = shortPk(APP_PUBKEY);
 
@@ -523,6 +666,11 @@
     let sendGeneration = 0;
     let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
     let pendingByTxId = new Map(); // requestTxId -> history entry
+
+    // Global echo log (durable, server-side). Accumulated across "Load more".
+    let globalLog = [];            // array of server event rows
+    let globalCursor = null;       // nextCursor for pagination
+    let globalLoading = false;
 
     function purgeOldHistoryVersions() {
       try {
@@ -728,6 +876,23 @@
       tick();
     }
 
+    /* Transient retry in progress — the echo send failed for a transient
+       reason and is in backoff. Distinct striped state + label from the
+       normal "waiting for echo" phase so the user knows it's recovering. */
+    function retryPhaseProgressBar(trackingTxId, attempt) {
+      pbCancelHide();
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "echoing"; // reuse the waiting-phase machinery
+      _pbTrackingTxId = trackingTxId || null;
+      const el = pbEl();
+      if (el) el.classList.remove("hide");
+      const fill = pbFill();
+      if (fill) { fill.className = "tx-progress-fill retrying"; fill.style.width = "95%"; }
+      const label = "Retrying echo…" + (attempt ? " (attempt " + attempt + "/30)" : "");
+      pbSetLabel(label, "tx-progress-label warn", true);
+    }
+
     /* Echo arrived — show green completion + total round-trip, then hide. */
     function completeEchoPhaseProgressBar(totalRoundTripMs) {
       stopProgressTick();
@@ -840,6 +1005,10 @@
         status: "sending",
         echoAmount: null,
         error: null,
+        errorRaw: null,
+        errorCategory: null,
+        nextRetryAtMs: null,
+        retryAttempts: 0,
         server: null,
         confirmedAtWall: null,
         _confirmedAtPerf: null,
@@ -974,8 +1143,9 @@
     function renderLatest(entry) {
       if (!entry) return;
       latestCard.style.display = "block";
-      latestStatus.className = "status " + entry.status;
-      latestStatus.textContent = entry.status;
+      const dStatus = displayStatus(entry);
+      latestStatus.className = "status " + dStatus;
+      latestStatus.textContent = dStatus;
       latestSentAmount.textContent = entry.sentAmount + " tokens";
       latestEchoAmount.textContent = entry.echoAmount != null
         ? entry.echoAmount + " tokens"
@@ -1039,11 +1209,42 @@
       if (echoChip) latestBlocks.appendChild(echoChip);
       latestBlocks.style.display = (reqChip || echoChip) ? "flex" : "none";
 
-      if (entry.error) {
-        latestError.style.display = "block";
-        latestError.textContent = entry.error;
+      // Retry indicator (transient errors only): "Retrying… (attempt 3/30,
+      // next in 42s)". next-retry countdown is derived from nextRetryAtMs.
+      if (entry.errorCategory === "transient" && dStatus === "retrying") {
+        let txt = "Retrying…";
+        const parts = [];
+        if (entry.retryAttempts) parts.push("attempt " + entry.retryAttempts + "/30");
+        if (entry.nextRetryAtMs) {
+          const secs = Math.max(0, Math.round((entry.nextRetryAtMs - Date.now()) / 1000));
+          parts.push("next in " + secs + "s");
+        }
+        if (parts.length) txt += " (" + parts.join(", ") + ")";
+        latestRetryText.textContent = txt;
+        latestRetry.style.display = "flex";
       } else {
-        latestError.style.display = "none";
+        latestRetry.style.display = "none";
+      }
+
+      // Friendly outcome message + raw detail. Styled by category:
+      // skip = neutral info, failed = red, transient = amber.
+      const cat = entry.errorCategory;
+      const raw = entry.errorRaw || entry.error || null;
+      if (raw && (cat === "skip" || cat === "permanent" || cat === "transient")) {
+        const cls = cat === "permanent" ? "failed" : (cat === "skip" ? "skip" : "transient");
+        latestMsg.className = "latest-msg " + cls;
+        latestMsg.textContent = friendlyError(raw);
+        latestMsg.style.display = "block";
+        // Only surface the raw string when it differs from the friendly text.
+        if (friendlyError(raw) !== raw) {
+          latestErrDetail.textContent = raw;
+          latestErrDetail.style.display = "block";
+        } else {
+          latestErrDetail.style.display = "none";
+        }
+      } else {
+        latestMsg.style.display = "none";
+        latestErrDetail.style.display = "none";
       }
 
       // Run the live timer for either in-flight phase ("sending" =
@@ -1125,6 +1326,40 @@
       }
     }
 
+    /* Shared row builder for both "Your attempts" and the "Global echo log".
+       `spec` is a normalized shape:
+         { sentAmount, echoAmount, statusText, totalText,
+           blockHeight, blockHash, blockLabel } */
+    function buildAttemptRow(spec) {
+      const row = document.createElement("div");
+      row.className = "history-row";
+
+      const left = document.createElement("div");
+      left.className = "left";
+      const amt = document.createElement("span");
+      amt.className = "amount";
+      amt.textContent = spec.sentAmount + " → " + (spec.echoAmount != null ? spec.echoAmount : "?");
+      const status = document.createElement("span");
+      status.className = "status " + spec.statusText;
+      status.textContent = spec.statusText;
+      status.style.marginLeft = "8px";
+      left.appendChild(amt);
+      left.appendChild(status);
+
+      const right = document.createElement("div");
+      right.className = "right";
+      const totalEl = document.createElement("div");
+      totalEl.textContent = spec.totalText;
+      right.appendChild(totalEl);
+
+      const chip = buildBlockChip(spec.blockLabel, spec.blockHeight, spec.blockHash);
+      if (chip) right.appendChild(chip);
+
+      row.appendChild(left);
+      row.appendChild(right);
+      return row;
+    }
+
     function renderHistory() {
       historyEl.innerHTML = "";
       if (history.length === 0) {
@@ -1135,45 +1370,138 @@
         return;
       }
       for (const h of history) {
-        const row = document.createElement("div");
-        row.className = "history-row";
-
-        const left = document.createElement("div");
-        left.className = "left";
-        const amt = document.createElement("span");
-        amt.className = "amount";
-        amt.textContent = h.sentAmount + " → " + (h.echoAmount != null ? h.echoAmount : "?");
-        const status = document.createElement("span");
-        status.className = "status " + h.status;
-        status.textContent = h.status;
-        status.style.marginLeft = "8px";
-        left.appendChild(amt);
-        left.appendChild(status);
-
-        const right = document.createElement("div");
-        right.className = "right";
         const totalText = (h.sentLatencyMs != null && h.echoLatencyMs != null)
           ? fmtMs(h.sentLatencyMs + h.echoLatencyMs)
           : (h.status === "skipped" || h.status === "failed" ? "—" : "…");
-        const totalEl = document.createElement("div");
-        totalEl.textContent = totalText;
-        right.appendChild(totalEl);
-
-        // Block chip (echo block preferred; falls back to request block
-        // when the echo isn't on chain yet — typical for an entry still
-        // in flight). Skipped/failed entries that never produced an echo
-        // block get a request-block chip when one is known.
+        // Echo block preferred; falls back to the request block while in flight.
         const useEcho = h.echoBlockHeight != null;
-        const histChip = buildBlockChip(
-          useEcho ? "Echo" : "Request",
-          useEcho ? h.echoBlockHeight : h.requestBlockHeight,
-          useEcho ? h.echoBlockHash : h.requestBlockHash
-        );
-        if (histChip) right.appendChild(histChip);
+        historyEl.appendChild(buildAttemptRow({
+          sentAmount: h.sentAmount,
+          echoAmount: h.echoAmount,
+          statusText: displayStatus(h),
+          totalText,
+          blockLabel: useEcho ? "Echo" : "Request",
+          blockHeight: useEcho ? h.echoBlockHeight : h.requestBlockHeight,
+          blockHash: useEcho ? h.echoBlockHash : h.requestBlockHash,
+        }));
+      }
+    }
 
-        row.appendChild(left);
-        row.appendChild(right);
-        historyEl.appendChild(row);
+    /* ── Global echo log (durable, server-side) ───────────────── */
+    function globalRowTotalText(ev) {
+      // Server-side total round-trip = chain confirm ts − request chain ts.
+      if (ev.status === "confirmed" && ev.echoConfirmedTs != null && ev.requestTs != null) {
+        return fmtMs(Math.max(0, ev.echoConfirmedTs - ev.requestTs));
+      }
+      if (ev.status === "skipped" || ev.status === "failed") return "—";
+      return "…";
+    }
+
+    function renderGlobalLog() {
+      globalLogEl.innerHTML = "";
+      // De-dupe against the user's own attempts (those carry richer local
+      // timing); a global row whose requestTxId matches a local entry is
+      // suppressed so it isn't shown twice.
+      const localIds = new Set(history.map((h) => h.requestTxId).filter(Boolean));
+      const rows = globalLog.filter((ev) => !localIds.has(ev.requestTxId));
+      if (rows.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "No echoes recorded yet.";
+        globalLogEl.appendChild(empty);
+        return;
+      }
+      for (const ev of rows) {
+        const useEcho = ev.echoBlockHeight != null;
+        globalLogEl.appendChild(buildAttemptRow({
+          sentAmount: ev.requestAmount,
+          echoAmount: ev.echoAmount,
+          statusText: displayStatus(ev),
+          totalText: globalRowTotalText(ev),
+          blockLabel: useEcho ? "Echo" : "Request",
+          blockHeight: useEcho ? ev.echoBlockHeight : ev.requestBlockHeight,
+          blockHash: useEcho ? ev.echoBlockHash : ev.requestBlockHash,
+        }));
+      }
+    }
+
+    function renderDiagnostics(stats) {
+      if (!stats) { diagCard.style.display = "none"; return; }
+      diagCard.style.display = "block";
+      diagSuccess.textContent = stats.successRate != null
+        ? Math.round(stats.successRate * 100) + "%" : "—";
+      // Percentiles are noisy on tiny samples — require ≥10 confirmed events.
+      const enough = (stats.confirmed || 0) >= 10;
+      diagMedian.textContent = (enough && stats.medianTotalMs != null) ? fmtMs(stats.medianTotalMs) : "—";
+      diagP95.textContent = (enough && stats.p95TotalMs != null) ? fmtMs(stats.p95TotalMs) : "—";
+      const bits = [];
+      if (stats.total != null) bits.push(stats.total + " recent");
+      if (stats.confirmed != null) bits.push(stats.confirmed + " ok");
+      if (stats.failed) bits.push(stats.failed + " failed");
+      if (stats.skipped) bits.push(stats.skipped + " skipped");
+      if (stats.mode === "mock") bits.push("mock mode");
+      if (!enough) bits.push("latency needs ≥10 confirmed");
+      diagMeta.textContent = bits.join(" · ");
+    }
+
+    async function fetchHistoryPage(before) {
+      const params = new URLSearchParams();
+      params.set("limit", String(GLOBAL_LOG_PAGE));
+      if (before) params.set("before", before);
+      const r = await fetch("/__echo/history?" + params.toString(), {
+        cache: "no-store",
+        headers: authHeaders(),
+      });
+      if (!r.ok) throw new Error("history " + r.status);
+      return r.json();
+    }
+
+    // Auto-refresh: re-fetch the newest page for liveness + stats, but keep
+    // any older pages the user pulled in via "Load more" (those are static).
+    async function refreshGlobalFirstPage() {
+      if (globalLoading) return;
+      globalLoading = true;
+      try {
+        const data = await fetchHistoryPage(null);
+        const fresh = Array.isArray(data.events) ? data.events : [];
+        const wasEmpty = globalLog.length === 0;
+        const freshIds = new Set(fresh.map((e) => e.requestTxId));
+        const tail = globalLog.filter((e) => !freshIds.has(e.requestTxId));
+        globalLog = fresh.concat(tail);
+        // Only seed the pagination cursor on the very first load; afterwards
+        // globalCursor tracks the end of the manually-loaded tail.
+        if (wasEmpty) globalCursor = data.nextCursor || null;
+        renderGlobalLog();
+        renderDiagnostics(data.stats);
+        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+      } catch (_) {
+        /* transient — next poll retries */
+      } finally {
+        globalLoading = false;
+      }
+    }
+
+    // "Load more": append the next older page; cursor advances. Static — the
+    // auto-refresh above won't drop what's appended here.
+    async function loadMoreGlobal() {
+      if (globalLoading || !globalCursor) return;
+      globalLoading = true;
+      if (loadMoreBtn) loadMoreBtn.disabled = true;
+      try {
+        const data = await fetchHistoryPage(globalCursor);
+        if (Array.isArray(data.events) && data.events.length) {
+          const seen = new Set(globalLog.map((e) => e.requestTxId));
+          for (const ev of data.events) if (!seen.has(ev.requestTxId)) globalLog.push(ev);
+        }
+        globalCursor = data.nextCursor || null;
+        renderGlobalLog();
+        renderDiagnostics(data.stats);
+        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+      } catch (_) {
+        /* ignore — user can retry */
+      } finally {
+        globalLoading = false;
+        if (loadMoreBtn) loadMoreBtn.disabled = false;
       }
     }
 
@@ -1210,6 +1538,43 @@
       return h;
     }
 
+    /* ── Service-health banner ────────────────────────────────
+       Driven by the sanitized `health` object on /__echo/state:
+       { degraded, openAnomalyCount, worst: "latency"|"failures"|"stall" }.
+       No detail beyond the category — just enough to reassure the user
+       that a slow/missing echo is the service, not their phone. */
+    function updateHealthBanner(health) {
+      if (!health || !health.degraded) {
+        healthBanner.classList.add("hide");
+        return;
+      }
+      let msg, critical = false;
+      switch (health.worst) {
+        case "stall":
+          msg = "Echoes are delayed right now — the service is catching up. Your tokens are safe.";
+          critical = true;
+          break;
+        case "failures":
+          msg = "Echoes are failing right now. Your tokens are safe; please try again shortly.";
+          critical = true;
+          break;
+        default:
+          msg = "Echo is running slower than usual right now.";
+      }
+      healthBanner.textContent = msg;
+      healthBanner.classList.toggle("critical", critical);
+      healthBanner.classList.remove("hide");
+    }
+
+    async function pollHealth() {
+      try {
+        const r = await fetch("/__echo/state", { cache: "no-store", headers: authHeaders() });
+        if (!r.ok) return;
+        const resp = await r.json();
+        updateHealthBanner(resp && resp.health);
+      } catch (_) {}
+    }
+
     /* ── Server state polling ─────────────────────────────── */
     async function pollServerState() {
       if (pendingByTxId.size === 0) return;
@@ -1222,6 +1587,7 @@
         if (!r.ok) return;
         resp = await r.json();
       } catch (_) { return; }
+      updateHealthBanner(resp && resp.health);
       if (!resp || !Array.isArray(resp.events)) return;
 
       const byId = new Map();
@@ -1256,22 +1622,35 @@
           entry.echoBlockHash = ev.echoBlockHash;
         }
 
+        // Structured error / retry fields (server-classified).
+        if (ev.errorCategory !== undefined && entry.errorCategory !== ev.errorCategory) {
+          entry.errorCategory = ev.errorCategory || null;
+          dirty = true;
+        }
+        entry.nextRetryAtMs = ev.nextRetryAtMs != null ? ev.nextRetryAtMs : null;
+        if (ev.retryAttempts != null) entry.retryAttempts = ev.retryAttempts;
+        if (ev.error != null) entry.errorRaw = ev.error;
+
         if (ev.status === "skipped") {
           entry.status = "skipped";
           entry.error = ev.error || "Skipped by server";
+          entry.errorRaw = ev.error || entry.error;
+          entry.errorCategory = ev.errorCategory || "skip";
           pendingByTxId.delete(txId);
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
-          pbOutcome = { kind: "fail", txId, message: "Skipped: " + entry.error };
+          pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
           continue;
         }
         if (ev.status === "failed") {
           entry.status = "failed";
           entry.error = ev.error || "Echo send failed";
+          entry.errorRaw = ev.error || entry.error;
+          entry.errorCategory = ev.errorCategory || "permanent";
           pendingByTxId.delete(txId);
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
-          pbOutcome = { kind: "fail", txId, message: "Echo failed: " + entry.error };
+          pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
           continue;
         }
 
@@ -1295,8 +1674,16 @@
           pbOutcome = { kind: "ok", txId, totalMs: entry.totalLatencyMs };
         } else if (ev.status === "echoing" && entry.status !== "echoing") {
           entry.status = "echoing";
+          entry.errorCategory = null;
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
+        } else if (ev.status === "pending" && ev.retryAttempts > 0) {
+          // Transient retry in backoff — distinct from "waiting for echo".
+          if (entry.status !== "pending" || entry.errorCategory !== "transient") dirty = true;
+          entry.status = "pending";
+          entry.errorCategory = "transient";
+          if (history[0] === entry) latestUpdated = entry;
+          if (_pbTrackingTxId === txId) pbOutcome = { kind: "retry", txId, attempt: ev.retryAttempts };
         }
       }
 
@@ -1311,6 +1698,7 @@
       // newer attempt, so older confirmations harmlessly fall through here.
       if (pbOutcome && pbOutcome.txId === _pbTrackingTxId) {
         if (pbOutcome.kind === "ok") completeEchoPhaseProgressBar(pbOutcome.totalMs);
+        else if (pbOutcome.kind === "retry") retryPhaseProgressBar(pbOutcome.txId, pbOutcome.attempt);
         else failProgressBar(pbOutcome.message);
       }
     }
@@ -1320,6 +1708,8 @@
       loadHistory();
       renderHistory();
       if (history[0]) renderLatest(history[0]);
+
+      if (loadMoreBtn) loadMoreBtn.addEventListener("click", loadMoreGlobal);
 
       // If we were reloaded mid-echo, restore the progress bar so the user
       // gets the same persistent visual instead of looking at a frozen UI.
@@ -1370,6 +1760,16 @@
 
       setInterval(pollServerState, STATE_POLL_MS);
       pollServerState();
+
+      // Global echo log + diagnostics: initial fetch, then slow auto-refresh
+      // of the newest page (loaded older pages stay put).
+      refreshGlobalFirstPage();
+      setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
+
+      // Health banner polls on its own slower cadence so it stays current
+      // even when there are no pending echoes (pollServerState idles then).
+      setInterval(pollHealth, 10000);
+      pollHealth();
     })();
   </script>
 </body>

@@ -38,6 +38,7 @@ const {
   createUsernamesCache,
   createNodeStatusProbe,
   createDappServerStatus,
+  discoverChainInfo,
 } = require("./lib/dapp-server");
 const createEcho = require("./echo-logic");
 
@@ -62,6 +63,17 @@ function getExplorerPublicBase() {
 // ── CLI flags ────────────────────────────────────────────────────────────────
 const LOCAL_DEV = process.argv.includes("--local-dev");
 const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+// Environment + anomaly-detection persistence config.
+const IS_STAGING = process.env.USERNODE_ENV === "staging";
+// Directory for the better-sqlite3 metrics DB. Mounted as a volume in the
+// Dockerfile so historical baselines survive container restarts; if it isn't
+// writable (or the native module can't load) the metrics store degrades to
+// in-memory and reports persistent:false.
+const ECHO_DATA_DIR = process.env.ECHO_DATA_DIR || "/app/data";
+// Opt-in synthetic baseline seeding so the detector has history to compare
+// against in a fresh staging container. Ignored outside staging.
+const ECHO_SEED_BASELINE = process.env.ECHO_SEED_BASELINE === "1";
 
 // ── Echo config ──────────────────────────────────────────────────────────────
 const ECHO_APP_PUBKEY = process.env.ECHO_APP_PUBKEY || "ut1_echo_default_pubkey";
@@ -94,11 +106,25 @@ const echo = createEcho({
   nodeRpcUrl: NODE_RPC_URL,
   localDev: LOCAL_DEV,
   mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
+  // Anomaly-detection persistence
+  dataDir: ECHO_DATA_DIR,
+  isStaging: IS_STAGING,
+  seedBaseline: ECHO_SEED_BASELINE,
 });
-// echo.start() runs the sidecar /wallet/signer ensureReady loop; chain
-// plumbing (recipient + sender pollers, backfill, mock drain) is in echoCache
-// below.
-echo.start();
+// echo.start() runs the sidecar /wallet/signer ensureReady loop + hydrates
+// the durable diagnostic log into memory; chain plumbing (recipient + sender
+// pollers, backfill, mock drain) is in echoCache below. We discover the
+// active chain id *first* (in chain mode) so the durable rows are stamped and
+// hydrated under the right chain_id. onChainReset keeps it current afterwards.
+(async () => {
+  if (!LOCAL_DEV) {
+    try {
+      const info = await discoverChainInfo();
+      if (info && info.chainId) echo.setChainId(info.chainId);
+    } catch (_) {}
+  }
+  echo.start();
+})();
 
 const echoCache = createAppStateCache({
   name: "echo",
@@ -108,7 +134,12 @@ const echoCache = createAppStateCache({
   handleRequest: echo.handleRequest,
   onChainReset(newId, oldId) {
     console.log(`[echo] chain reset ${oldId} -> ${newId}, resetting state`);
-    echo.reset();
+    // Stamp new rows with the new chain id; the durable log keeps the old
+    // chain's rows (history is preserved, reads scope to the current chain).
+    // Also pass it as the metrics epoch so post-reset samples baseline
+    // independently and prior-epoch anomalies auto-resolve.
+    echo.setChainId(newId);
+    echo.reset(newId);
   },
   localDev: LOCAL_DEV,
   mockTransactions: LOCAL_DEV ? mockApi.transactions : null,
@@ -224,6 +255,10 @@ const dappServerStatus = createDappServerStatus({
 dappServerStatus.registerCache(echoCache);
 dappServerStatus.registerCache(usernamesCache);
 dappServerStatus.registerPending("echo", () => echo.getPending());
+// Surface open anomalies as their own section on the operator /status page.
+// Uses the existing registerPending hook (no edits to the vendored
+// lib/dapp-server.js); each open anomaly renders as one row.
+dappServerStatus.registerPending("anomalies", () => echo.getAnomalyStatusRows());
 
 app.use((req, res, next) => {
   if (dappServerStatus.handleRequest(req, res, req.path)) return;
