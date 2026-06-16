@@ -444,7 +444,10 @@
 
       <!-- Your attempts (per-device, localStorage) -->
       <div class="card">
-        <h2>Your attempts</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <h2 style="margin:0">Your attempts</h2>
+          <button id="exportCsvBtn" style="display:none;font-size:12px;color:var(--muted);background:none;border:1px solid var(--muted);border-radius:4px;padding:3px 10px;cursor:pointer">Export CSV</button>
+        </div>
         <div class="section-sub">Saved on this device only.</div>
         <div id="history"></div>
       </div>
@@ -696,6 +699,8 @@
     const latestBlocks = document.getElementById("latestBlocks");
     const autoRefreshDot = document.getElementById("autoRefreshDot");
     const historyEl = document.getElementById("history");
+    const exportCsvBtn = document.getElementById("exportCsvBtn");
+    exportCsvBtn.addEventListener("click", exportCsv);
     const globalLogEl = document.getElementById("globalLog");
     const loadMoreBtn = document.getElementById("loadMoreBtn");
     const diagCard = document.getElementById("diagCard");
@@ -1511,6 +1516,44 @@
       }
     }
 
+    function exportCsv() {
+      function csvCell(v) {
+        if (v == null) return '""';
+        return '"' + String(v).replace(/"/g, '""') + '"';
+      }
+      const headers = [
+        "Timestamp","Amount sent","Amount received","Status",
+        "Total round-trip (ms)","Send phase (ms)","Echo phase (ms)",
+        "Server poll lag (ms)","Server echo queue (ms)","Server chain RTT (ms)",
+        "Request tx ID","Request block height","Echo block height"
+      ];
+      const rows = history.map(h => [
+        new Date(h.sentAtWall).toISOString(),
+        h.sentAmount,
+        h.echoAmount,
+        h.status,
+        h.totalLatencyMs != null ? h.totalLatencyMs : (h.sentLatencyMs != null && h.echoLatencyMs != null ? h.sentLatencyMs + h.echoLatencyMs : null),
+        h.sentLatencyMs,
+        h.echoLatencyMs,
+        h.server ? h.server.pollLagMs : null,
+        h.server ? h.server.echoQueueMs : null,
+        h.server ? h.server.chainRttMs : null,
+        h.requestTxId,
+        h.requestBlockHeight,
+        h.echoBlockHeight,
+      ].map(csvCell).join(","));
+      const csv = "﻿" + [headers.map(csvCell).join(","), ...rows].join("\r\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "echo-history-" + new Date().toISOString().slice(0, 10) + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
     /* Shared row builder for both "Your attempts" and the "Global echo log".
        `spec` is a normalized shape:
          { sentAmount, echoAmount, statusText, totalText,
@@ -1547,6 +1590,7 @@
 
     function renderHistory() {
       historyEl.innerHTML = "";
+      exportCsvBtn.style.display = history.length > 0 ? "" : "none";
       if (history.length === 0) {
         const empty = document.createElement("div");
         empty.className = "history-empty";
