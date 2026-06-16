@@ -1016,13 +1016,6 @@ function createEcho(opts) {
     sendJson(req, res, { events: events_, nextCursor, stats, mode });
   }
 
-  async function handleLeaderboard(req, res) {
-    if (req.method === "HEAD") { res.writeHead(200); res.end(); return; }
-    const cid = effectiveChainId();
-    const entries = store.isReady() ? await store.getLeaderboard(cid) : [];
-    sendJson(req, res, { entries, chainId: cid });
-  }
-
   // Public per-user aggregate: GET /__echo/my-stats?address=<pubkey>. Same
   // posture as /__echo/state and /__echo/history (no /api/ prefix, no auth,
   // no-store). Scopes to the current chain. The address is caller-supplied;
@@ -1130,13 +1123,19 @@ function createEcho(opts) {
   }
 
   // In-memory leaderboard fallback: aggregate confirmed events from the Map.
-  function computeLeaderboardFromMemory(limit) {
+  // window: 'all' (default) | '1d' (last 24 h) | '7d' (last 7 days)
+  function computeLeaderboardFromMemory(limit, window) {
     const lim = Math.max(1, Math.min(100, limit || 20));
+    const now = Date.now();
+    const cutoffMs = window === "1d" ? now - 86400000
+                   : window === "7d" ? now - 7 * 86400000
+                   : null;
     const byAddress = new Map();
     for (const ev of events.values()) {
       if (ev.status !== "confirmed") continue;
       const addr = ev.requestFrom;
       if (!addr) continue;
+      if (cutoffMs !== null && (ev.echoConfirmedTs == null || ev.echoConfirmedTs < cutoffMs)) continue;
       if (!byAddress.has(addr)) byAddress.set(addr, { tokensSent: 0, echoCount: 0, latSum: 0, latCount: 0 });
       const a = byAddress.get(addr);
       a.tokensSent += ev.requestAmount || 0;
@@ -1177,15 +1176,25 @@ function createEcho(opts) {
   }
 
   async function handleLeaderboard(req, res) {
+    let window = "all";
+    try {
+      const u = new URL(req.url, "http://x");
+      const w = u.searchParams.get("window");
+      if (w === "1d" || w === "7d") window = w;
+    } catch (_) {}
+
     const cid  = effectiveChainId();
     const mode = localDev ? "mock" : "chain";
-    let entries;
+    let rows, partialInMemory;
     if (store.isReady()) {
-      entries = await store.queryLeaderboard(cid, 20);
+      const result = await store.queryLeaderboard(cid, 20, window);
+      rows = result.rows;
+      partialInMemory = result.partialInMemory;
     } else {
-      entries = computeLeaderboardFromMemory(20);
+      rows = computeLeaderboardFromMemory(20, window);
+      partialInMemory = true;
     }
-    sendJson(req, res, { entries, chainId: cid, count: entries.length, mode });
+    sendJson(req, res, { rows, window, partialInMemory, chainId: cid, count: rows.length, mode });
   }
 
   function handleRequest(req, res, pathname) {
@@ -1260,16 +1269,6 @@ function createEcho(opts) {
         if (!res.headersSent) {
           res.writeHead(500, JSON_HEADERS);
           res.end(JSON.stringify({ error: "history unavailable" }));
-        }
-      });
-      return true;
-    }
-    if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
-      handleLeaderboard(req, res).catch((e) => {
-        console.error("[echo] leaderboard error:", e.message);
-        if (!res.headersSent) {
-          res.writeHead(500, JSON_HEADERS);
-          res.end(JSON.stringify({ error: "leaderboard unavailable" }));
         }
       });
       return true;

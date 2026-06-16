@@ -605,10 +605,21 @@ function createEchoStore(opts = {}) {
     }
   }
 
-  // Top senders ranked by total confirmed tokens. Returns [] when disabled.
-  async function queryLeaderboard(chainId, limit = 20) {
-    if (!isReady()) return [];
+  // Top senders ranked by total confirmed tokens. Returns { rows, partialInMemory }
+  // when disabled returns { rows: [], partialInMemory: false }.
+  // window: 'all' (default) | '1d' (last 24 h) | '7d' (last 7 days)
+  async function queryLeaderboard(chainId, limit = 20, window = "all") {
+    if (!isReady()) return { rows: [], partialInMemory: false };
     const lim = Math.max(1, Math.min(100, limit || 20));
+    const params = [chainId || null];
+    let timeFilter = "";
+    if (window === "1d") {
+      params.push(Date.now() - 86400000);
+      timeFilter = `AND echo_confirmed_ts >= $${params.length}`;
+    } else if (window === "7d") {
+      params.push(Date.now() - 7 * 86400000);
+      timeFilter = `AND echo_confirmed_ts >= $${params.length}`;
+    }
     const sql = `
       SELECT
         request_from AS address,
@@ -619,22 +630,26 @@ function createEchoStore(opts = {}) {
           AS avg_latency_ms
       FROM echo_events
       WHERE chain_id IS NOT DISTINCT FROM $1
+      ${timeFilter}
       GROUP BY request_from
       HAVING COUNT(*) FILTER (WHERE status = 'confirmed') > 0
       ORDER BY tokens_sent DESC
-      LIMIT $2
+      LIMIT ${lim}
     `;
     try {
-      const r = await pool.query(sql, [chainId || null, lim]);
-      return r.rows.map((row) => ({
-        address: row.address,
-        tokensSent: numOrNull(row.tokens_sent) || 0,
-        echoCount: row.echo_count || 0,
-        avgLatencyMs: numOrNull(row.avg_latency_ms),
-      }));
+      const r = await pool.query(sql, params);
+      return {
+        rows: r.rows.map((row) => ({
+          address: row.address,
+          tokensSent: numOrNull(row.tokens_sent) || 0,
+          echoCount: row.echo_count || 0,
+          avgLatencyMs: numOrNull(row.avg_latency_ms),
+        })),
+        partialInMemory: false,
+      };
     } catch (e) {
       console.error("[echo-store] queryLeaderboard error:", e.message);
-      return [];
+      return { rows: [], partialInMemory: false };
     }
   }
 
@@ -850,6 +865,42 @@ function createEchoStore(opts = {}) {
       }
     }
     if (lbSeeded > 0) console.log(`[echo-store] seeded ${lbSeeded} staging leaderboard demo rows`);
+
+    // Recent leaderboard rows — timestamps within the past few hours so the
+    // "Today" time-window tab shows non-empty data. txIds are date-scoped so
+    // each day's container boot inserts fresh rows (idempotent within a day).
+    const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const nowMs = Date.now();
+    const RECENT_LB_SENDERS = [
+      { suffix: "ra", count: 3, amount: 12 },
+      { suffix: "rb", count: 2, amount: 8  },
+      { suffix: "rc", count: 5, amount: 5  },
+    ];
+    let recentSeeded = 0;
+    for (const s of RECENT_LB_SENDERS) {
+      const addr = `ut1lbrecent${s.suffix}00000000000000000000000000000000000000000`;
+      for (let i = 0; i < s.count; i++) {
+        const reqTs  = nowMs - 3_600_000 - i * 900_000; // 1–4h ago
+        const echoTs = reqTs + 28_000;
+        const txId   = `staging-lb-today-${todayStr}-${s.suffix}-${String(i).padStart(3, "0")}`;
+        try {
+          const { rowCount } = await pool.query(
+            `INSERT INTO echo_events
+               (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+                status, request_ts, request_seen_at_ms,
+                echo_confirmed_ts, echo_confirmed_at_ms, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$8,$9,$9)
+             ON CONFLICT (request_tx_id) DO NOTHING`,
+            [txId, chainId || null, addr, s.amount, s.amount - 1, "confirmed",
+             reqTs, echoTs, new Date(reqTs)]
+          );
+          recentSeeded += rowCount || 0;
+        } catch (e) {
+          console.warn("[echo-store] recent lb seed row failed:", e.message);
+        }
+      }
+    }
+    if (recentSeeded > 0) console.log(`[echo-store] seeded ${recentSeeded} recent leaderboard demo rows`);
   }
 
   async function close() {

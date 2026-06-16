@@ -448,6 +448,21 @@
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
+    /* Leaderboard time-window tabs */
+    .lb-tab-bar { display: flex; gap: 4px; margin-bottom: 10px; }
+    .lb-tab {
+      font-size: 12px; padding: 3px 10px;
+      border-radius: 12px; border: 1px solid var(--border);
+      background: none; color: var(--muted); cursor: pointer;
+    }
+    .lb-tab.active {
+      background: var(--accent); border-color: var(--accent);
+      color: var(--accent-text);
+    }
+    .lb-partial-note {
+      font-size: 11px; color: var(--muted); margin-top: 8px; text-align: center;
+    }
+
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
       padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -695,8 +710,13 @@
       <!-- Leaderboard — top senders ranked by confirmed tokens echoed -->
       <div class="card" id="leaderboardCard" style="display:none">
         <h2>Leaderboard</h2>
-        <div class="section-sub">Top senders on the current chain.</div>
+        <div class="lb-tab-bar" id="lbTabBar1">
+          <button class="lb-tab" data-window="1d">Today</button>
+          <button class="lb-tab" data-window="7d">7 Days</button>
+          <button class="lb-tab active" data-window="all">All Time</button>
+        </div>
         <div id="leaderboard"></div>
+        <div class="lb-partial-note" id="lbPartialNote1" style="display:none">Showing recent in-memory data only — full history requires Postgres.</div>
       </div>
 
       <!-- Your attempts (per-device, localStorage) -->
@@ -721,7 +741,11 @@
       <!-- Leaderboard (all-time top senders by total tokens, confirmed echoes only) -->
       <div class="card">
         <h2>Leaderboard</h2>
-        <div class="section-sub">Top senders by total tokens echoed.</div>
+        <div class="lb-tab-bar" id="lbTabBar2">
+          <button class="lb-tab" data-window="1d">Today</button>
+          <button class="lb-tab" data-window="7d">7 Days</button>
+          <button class="lb-tab active" data-window="all">All Time</button>
+        </div>
         <table class="leaderboard-table" aria-label="Echo leaderboard">
           <thead>
             <tr>
@@ -736,6 +760,7 @@
             <tr><td colspan="5" class="history-empty">Loading…</td></tr>
           </tbody>
         </table>
+        <div class="lb-partial-note" id="lbPartialNote2" style="display:none">Showing recent in-memory data only — full history requires Postgres.</div>
       </div>
 
       <!-- Info -->
@@ -1299,6 +1324,8 @@
 
     // Leaderboard state: null = loading, false = fetch error, array = data.
     let leaderboard = null;
+    // Active time-window for both leaderboard sections.
+    let leaderboardWindow = "all";
 
     // Currently open accordion row (only one at a time).
     let openRow = null;
@@ -2353,8 +2380,9 @@
       return (ms / 1000).toFixed(1) + "s";
     }
 
-    function renderLeaderboard() {
+    function renderLeaderboardTable() {
       const tbody = document.getElementById("leaderboardBody");
+      const noteEl = document.getElementById("lbPartialNote2");
       if (!tbody) return;
       tbody.innerHTML = "";
       if (leaderboard === null) {
@@ -2365,6 +2393,7 @@
         td.textContent = "Loading…";
         tr.appendChild(td);
         tbody.appendChild(tr);
+        if (noteEl) noteEl.style.display = "none";
         return;
       }
       if (leaderboard === false) {
@@ -2375,8 +2404,10 @@
         td.textContent = "Couldn't load leaderboard.";
         tr.appendChild(td);
         tbody.appendChild(tr);
+        if (noteEl) noteEl.style.display = "none";
         return;
       }
+      if (noteEl) noteEl.style.display = leaderboard._partialInMemory ? "block" : "none";
       if (leaderboard.length === 0) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
@@ -2388,8 +2419,8 @@
         return;
       }
       leaderboard.forEach(function (entry, i) {
-        const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
-          ? window.UsernameUsernames.getUsernameSync(entry.address)
+        const displayName = (window.UsernodeUsernames && window.UsernodeUsernames.getUsernameSync)
+          ? window.UsernodeUsernames.getUsernameSync(entry.address)
           : entry.address.slice(-6);
         const tr = document.createElement("tr");
         const cells = [
@@ -2411,17 +2442,19 @@
 
     async function refreshLeaderboard() {
       try {
-        const r = await fetch("/__echo/leaderboard", {
+        const r = await fetch("/__echo/leaderboard?window=" + leaderboardWindow, {
           cache: "no-store",
           headers: authHeaders(),
         });
         if (!r.ok) throw new Error("leaderboard " + r.status);
         const data = await r.json();
-        leaderboard = Array.isArray(data.entries) ? data.entries : [];
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        rows._partialInMemory = !!data.partialInMemory;
+        leaderboard = rows;
       } catch (_) {
         if (leaderboard === null) leaderboard = false;
       }
-      renderLeaderboard();
+      renderLeaderboardTable();
     }
 
     function renderDiagnostics(stats) {
@@ -2509,13 +2542,15 @@
       } catch (_) { /* ignore — next tick retries */ }
     }
 
-    /* ── Leaderboard ─────────────────────────────────────────── */
-    function renderLeaderboard(entries) {
-      const card = document.getElementById("leaderboardCard");
-      const el   = document.getElementById("leaderboard");
+    /* ── Leaderboard (card-based) ────────────────────────────── */
+    function renderLeaderboardCards(entries) {
+      const card    = document.getElementById("leaderboardCard");
+      const el      = document.getElementById("leaderboard");
+      const noteEl  = document.getElementById("lbPartialNote1");
       if (!card || !el) return;
       card.style.display = "block";
       el.innerHTML = "";
+      if (noteEl) noteEl.style.display = (entries && entries._partialInMemory) ? "block" : "none";
       if (!entries || entries.length === 0) {
         const empty = document.createElement("div");
         empty.className = "history-empty";
@@ -2564,16 +2599,29 @@
 
     async function pollLeaderboard() {
       try {
-        const r = await fetch("/__echo/leaderboard", {
+        const r = await fetch("/__echo/leaderboard?window=" + leaderboardWindow, {
           cache: "no-store",
           headers: authHeaders(),
         });
         if (!r.ok) return;
         const data = await r.json();
-        if (data && Array.isArray(data.entries)) {
-          renderLeaderboard(data.entries);
+        if (data && Array.isArray(data.rows)) {
+          const rows = data.rows;
+          rows._partialInMemory = !!data.partialInMemory;
+          renderLeaderboardCards(rows);
         }
       } catch (_) {}
+    }
+
+    function setLeaderboardWindow(win) {
+      leaderboardWindow = win;
+      document.querySelectorAll(".lb-tab").forEach(function (btn) {
+        btn.classList.toggle("active", btn.dataset.window === win);
+      });
+      leaderboard = null;
+      renderLeaderboardTable();
+      refreshLeaderboard();
+      pollLeaderboard();
     }
 
     /* ── Success Rate Over Time chart ────────────────────────── */
@@ -3456,7 +3504,10 @@
       refreshGlobalFirstPage();
       setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
 
-      // Leaderboard: initial fetch, then slow refresh.
+      // Leaderboard: wire tab buttons, initial fetch, then slow refresh.
+      document.querySelectorAll(".lb-tab").forEach(function (btn) {
+        btn.addEventListener("click", function () { setLeaderboardWindow(btn.dataset.window); });
+      });
       refreshLeaderboard();
       setInterval(refreshLeaderboard, LEADERBOARD_POLL_MS);
 
@@ -3470,7 +3521,7 @@
       fetchSuccessRate();
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
-      // Leaderboard: initial fetch + 30s auto-refresh.
+      // Leaderboard (card-based): initial fetch + 30s auto-refresh.
       pollLeaderboard();
       setInterval(pollLeaderboard, 30000);
 
