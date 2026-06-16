@@ -314,6 +314,60 @@ function createEchoStore(opts = {}) {
     };
   }
 
+  async function getLeaderboard(chainId) {
+    if (!isReady()) return [];
+    const sql = `
+      SELECT
+        request_from          AS sender,
+        SUM(request_amount)   AS total_sent,
+        COUNT(*)::int         AS echo_count
+      FROM echo_events
+      WHERE chain_id = $1
+        AND status = 'confirmed'
+      GROUP BY request_from
+      ORDER BY total_sent DESC
+      LIMIT 10
+    `;
+    const r = await pool.query(sql, [chainId || null]);
+    return r.rows.map((row) => ({
+      sender: row.sender,
+      totalSent: numOrNull(row.total_sent) || 0,
+      echoCount: Number(row.echo_count) || 0,
+    }));
+  }
+
+  // Boot-time staging seed: inserts confirmed echo events for 5 distinct fake
+  // senders so the leaderboard renders with multiple rows in a fresh staging
+  // container. Idempotent via ON CONFLICT DO NOTHING.
+  async function seedStagingLeaderboard(chainId) {
+    if (!isReady()) return;
+    const seeds = [
+      ["seed-lb-alpha-1", "staging-demo-alpha",   150, 149],
+      ["seed-lb-alpha-2", "staging-demo-alpha",   200, 199],
+      ["seed-lb-alpha-3", "staging-demo-alpha",   100,  99],
+      ["seed-lb-beta-1",  "staging-demo-beta",     50,  49],
+      ["seed-lb-beta-2",  "staging-demo-beta",    250, 249],
+      ["seed-lb-gamma-1", "staging-demo-gamma",    50,  49],
+      ["seed-lb-gamma-2", "staging-demo-gamma",    50,  49],
+      ["seed-lb-gamma-3", "staging-demo-gamma",    25,  24],
+      ["seed-lb-gamma-4", "staging-demo-gamma",    25,  24],
+      ["seed-lb-delta-1", "staging-demo-delta",    80,  79],
+      ["seed-lb-eps-1",   "staging-demo-epsilon",  10,   9],
+      ["seed-lb-eps-2",   "staging-demo-epsilon",  10,   9],
+    ];
+    for (const [txId, sender, amt, echoAmt] of seeds) {
+      await pool.query(
+        `INSERT INTO echo_events
+           (request_tx_id, chain_id, request_from, request_amount,
+            echo_amount, status, retry_attempts)
+         VALUES ($1, $2, $3, $4, $5, 'confirmed', 0)
+         ON CONFLICT (request_tx_id) DO NOTHING`,
+        [txId, chainId || null, sender, amt, echoAmt]
+      );
+    }
+    console.log("[echo-store] staging leaderboard seed applied");
+  }
+
   async function prune() {
     if (!isReady()) return;
     // Age-based prune across all chains.
@@ -343,7 +397,7 @@ function createEchoStore(opts = {}) {
     }
   }
 
-  return { init, isReady, persist, hydrate, queryHistory, queryStats, prune, close };
+  return { init, isReady, persist, hydrate, queryHistory, queryStats, getLeaderboard, seedStagingLeaderboard, prune, close };
 }
 
 module.exports = createEchoStore;

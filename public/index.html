@@ -285,6 +285,21 @@
     .block-chip .arrow { font-size: 10px; opacity: 0.7; }
     .block-chip-label { font-size: 10px; color: var(--muted); margin-right: 2px; }
 
+    /* Leaderboard table */
+    .leaderboard-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .leaderboard-table th {
+      text-align: left; color: var(--muted); font-size: 11px; font-weight: 600;
+      padding: 0 6px 8px; text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .leaderboard-table th.lb-amount,
+    .leaderboard-table th.lb-count { text-align: right; }
+    .leaderboard-table tbody tr { border-top: 1px solid var(--border); }
+    .leaderboard-table td { padding: 8px 6px; }
+    .lb-rank { color: var(--muted); width: 24px; font-variant-numeric: tabular-nums; }
+    .lb-user { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lb-amount { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .lb-count { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
@@ -412,6 +427,25 @@
         <button class="load-more" id="loadMoreBtn" style="display:none">Load more</button>
       </div>
 
+      <!-- Leaderboard (all-time top senders by total tokens, confirmed echoes only) -->
+      <div class="card">
+        <h2>Leaderboard</h2>
+        <div class="section-sub">Top senders by total tokens echoed.</div>
+        <table class="leaderboard-table" aria-label="Echo leaderboard">
+          <thead>
+            <tr>
+              <th class="lb-rank">#</th>
+              <th>User</th>
+              <th class="lb-amount">Total sent</th>
+              <th class="lb-count">Echoes</th>
+            </tr>
+          </thead>
+          <tbody id="leaderboardBody">
+            <tr><td colspan="4" class="history-empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
       <!-- Info -->
       <div class="card info">
         <h2>How this works</h2>
@@ -489,6 +523,8 @@
     const STATE_POLL_MS = 2000;
     // Global echo log + diagnostics poll cadence (slower than state poll).
     const HISTORY_POLL_MS = 5000;
+    // Leaderboard refresh cadence — rank changes infrequently.
+    const LEADERBOARD_POLL_MS = 60000;
     const GLOBAL_LOG_PAGE = 25;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
 
@@ -663,6 +699,9 @@
     let globalLog = [];            // array of server event rows
     let globalCursor = null;       // nextCursor for pagination
     let globalLoading = false;
+
+    // Leaderboard state: null = loading, false = fetch error, array = data.
+    let leaderboard = null;
 
     function purgeOldHistoryVersions() {
       try {
@@ -1417,6 +1456,78 @@
       }
     }
 
+    /* ── Leaderboard ──────────────────────────────────────── */
+    function renderLeaderboard() {
+      const tbody = document.getElementById("leaderboardBody");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      if (leaderboard === null) {
+        // Still loading — keep the placeholder row set in HTML.
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "history-empty";
+        td.textContent = "Loading…";
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      if (leaderboard === false) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "history-empty";
+        td.textContent = "Couldn't load leaderboard.";
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      if (leaderboard.length === 0) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "history-empty";
+        td.textContent = "No confirmed echoes yet.";
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      leaderboard.forEach(function (entry, i) {
+        const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
+          ? window.UsernameUsernames.getUsernameSync(entry.sender)
+          : entry.sender.slice(-6);
+        const tr = document.createElement("tr");
+        const cells = [
+          { cls: "lb-rank",   text: String(i + 1) },
+          { cls: "lb-user",   text: displayName },
+          { cls: "lb-amount", text: Number(entry.totalSent).toLocaleString() },
+          { cls: "lb-count",  text: String(entry.echoCount) },
+        ];
+        cells.forEach(function (c) {
+          const td = document.createElement("td");
+          td.className = c.cls;
+          td.textContent = c.text;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function refreshLeaderboard() {
+      try {
+        const r = await fetch("/__echo/leaderboard", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error("leaderboard " + r.status);
+        const data = await r.json();
+        leaderboard = Array.isArray(data.entries) ? data.entries : [];
+      } catch (_) {
+        if (leaderboard === null) leaderboard = false;
+      }
+      renderLeaderboard();
+    }
+
     function renderDiagnostics(stats) {
       if (!stats) { diagCard.style.display = "none"; return; }
       diagCard.style.display = "block";
@@ -1757,6 +1868,10 @@
       // of the newest page (loaded older pages stay put).
       refreshGlobalFirstPage();
       setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
+
+      // Leaderboard: initial fetch, then slow refresh.
+      refreshLeaderboard();
+      setInterval(refreshLeaderboard, LEADERBOARD_POLL_MS);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).

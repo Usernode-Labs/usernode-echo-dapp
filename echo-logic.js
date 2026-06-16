@@ -929,6 +929,12 @@ function createEcho(opts) {
     sendJson(req, res, { events: events_, nextCursor, stats, mode });
   }
 
+  async function handleLeaderboard(req, res) {
+    if (req.method === "HEAD") { res.writeHead(200); res.end(); return; }
+    const cid = effectiveChainId();
+    const entries = store.isReady() ? await store.getLeaderboard(cid) : [];
+    sendJson(req, res, { entries, chainId: cid });
+  }
 
   function handleRequest(req, res, pathname) {
     if (pathname === "/__echo/anomalies" && (req.method === "GET" || req.method === "HEAD")) {
@@ -951,6 +957,16 @@ function createEcho(opts) {
         if (!res.headersSent) {
           res.writeHead(500, JSON_HEADERS);
           res.end(JSON.stringify({ error: "history unavailable" }));
+        }
+      });
+      return true;
+    }
+    if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
+      handleLeaderboard(req, res).catch((e) => {
+        console.error("[echo] leaderboard error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "leaderboard unavailable" }));
         }
       });
       return true;
@@ -1008,6 +1024,14 @@ function createEcho(opts) {
         trimEvents();
       } catch (e) {
         console.error("[echo] hydrate failed:", e.message);
+      }
+
+      if (opts.isStaging) {
+        try {
+          await store.seedStagingLeaderboard(effectiveChainId());
+        } catch (e) {
+          console.warn("[echo] staging leaderboard seed failed:", e.message);
+        }
       }
     })();
 
