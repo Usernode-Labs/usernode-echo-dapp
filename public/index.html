@@ -258,15 +258,58 @@
     }
     .history-row {
       display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap;
       gap: 12px;
       padding: 10px 0;
       border-top: 1px solid var(--border);
       font-variant-numeric: tabular-nums;
+      cursor: pointer;
     }
     .history-row:first-child { border-top: 0; }
     .history-row .left { font-size: 13px; }
     .history-row .right { font-size: 12px; color: var(--muted); text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
     .history-row .amount { font-weight: 600; }
+
+    /* Accordion chevron (rotates when row is open) */
+    .detail-chevron {
+      font-size: 11px; color: var(--muted);
+      display: inline-block; user-select: none;
+      transition: transform 0.18s ease;
+      margin-top: 2px;
+    }
+    .history-row[data-open] .detail-chevron { transform: rotate(180deg); }
+
+    /* Accordion detail panel */
+    .history-detail {
+      display: none;
+      flex: 0 0 100%;
+      padding-top: 10px;
+      border-top: 1px dashed var(--border);
+      margin-top: 2px;
+    }
+    .history-row[data-open] > .history-detail { display: block; }
+
+    /* Key/value fields inside the detail panel */
+    .detail-field {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 3px 0; font-size: 12px;
+    }
+    .detail-label {
+      color: var(--muted); font-size: 11px;
+      min-width: 80px; flex-shrink: 0;
+    }
+    .detail-txid {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; background: var(--border);
+      padding: 1px 5px; border-radius: 4px;
+    }
+    .copy-btn {
+      background: none; border: none; cursor: pointer;
+      font-size: 12px; color: var(--accent);
+      padding: 0 3px; margin-left: 2px;
+      border-radius: 3px; line-height: 1.4; vertical-align: middle;
+    }
+    .copy-btn:hover { background: var(--chip-bg); }
 
     /* Explorer block link (chip).
        Surfaces the on-chain block height for the request tx and the echo
@@ -614,6 +657,222 @@
       return node;
     }
 
+    /* ── Transaction detail panel builders ───────────────────
+       Each returns a DocumentFragment / div to append lazily on first
+       expand. Local entries use wall-clock data; global entries use
+       chain timestamps. Both reuse existing .timing / .timing-section /
+       .block-chips / .latest-msg / .err-detail CSS classes. */
+
+    function appendDetailField(parent, labelText, valueText) {
+      const row = document.createElement("div");
+      row.className = "detail-field";
+      const lbl = document.createElement("span");
+      lbl.className = "detail-label";
+      lbl.textContent = labelText;
+      const val = document.createElement("span");
+      val.textContent = valueText;
+      row.appendChild(lbl);
+      row.appendChild(val);
+      parent.appendChild(row);
+    }
+
+    function appendDetailTxId(parent, labelText, txId) {
+      const row = document.createElement("div");
+      row.className = "detail-field";
+      const lbl = document.createElement("span");
+      lbl.className = "detail-label";
+      lbl.textContent = labelText;
+      const valueWrap = document.createElement("span");
+      const code = document.createElement("code");
+      code.className = "detail-txid";
+      code.textContent = txId.slice(0, 8) + "…" + txId.slice(-8);
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "copy-btn";
+      copyBtn.textContent = "⎘";
+      copyBtn.setAttribute("aria-label", "Copy transaction ID");
+      copyBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(txId).then(() => {
+          copyBtn.textContent = "Copied!";
+          setTimeout(() => { copyBtn.textContent = "⎘"; }, 1500);
+        }).catch(() => {});
+      });
+      valueWrap.appendChild(code);
+      valueWrap.appendChild(copyBtn);
+      row.appendChild(lbl);
+      row.appendChild(valueWrap);
+      parent.appendChild(row);
+    }
+
+    function appendDetailStatus(parent, dStatus) {
+      const row = document.createElement("div");
+      row.className = "detail-field";
+      const lbl = document.createElement("span");
+      lbl.className = "detail-label";
+      lbl.textContent = "Status";
+      const badge = document.createElement("span");
+      badge.className = "status " + dStatus;
+      badge.textContent = dStatus;
+      row.appendChild(lbl);
+      row.appendChild(badge);
+      parent.appendChild(row);
+    }
+
+    function appendTimingSection(parent, headingText, rows) {
+      // rows = [ [labelText, valueText, isMuted?], ... ]
+      const section = document.createElement("div");
+      section.className = "timing-section";
+      if (headingText) {
+        const h = document.createElement("div");
+        h.style.cssText = "font-size:12px;color:var(--muted);margin-bottom:8px";
+        h.textContent = headingText;
+        section.appendChild(h);
+      }
+      const grid = document.createElement("div");
+      grid.className = "timing";
+      for (const [label, value, muted] of rows) {
+        const lbl = document.createElement("div");
+        lbl.className = "label";
+        lbl.textContent = label;
+        const val = document.createElement("div");
+        val.className = muted ? "val muted" : "val";
+        val.textContent = value;
+        grid.appendChild(lbl);
+        grid.appendChild(val);
+      }
+      section.appendChild(grid);
+      parent.appendChild(section);
+    }
+
+    function appendDetailBlockChips(parent, reqH, reqHash, echoH, echoHash) {
+      const reqChip = buildBlockChip("Request", reqH, reqHash);
+      const echoChip = buildBlockChip("Echo", echoH, echoHash);
+      if (!reqChip && !echoChip) return;
+      const wrap = document.createElement("div");
+      wrap.className = "block-chips";
+      wrap.style.marginTop = "10px";
+      if (reqChip) wrap.appendChild(reqChip);
+      if (echoChip) wrap.appendChild(echoChip);
+      parent.appendChild(wrap);
+    }
+
+    // Detail panel for "Your attempts" (local history entries).
+    function buildLocalDetail(entry) {
+      const wrap = document.createElement("div");
+
+      const fmtWall = (ms) => ms != null
+        ? new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+        : null;
+
+      if (entry.sentAtWall) appendDetailField(wrap, "Sent at", fmtWall(entry.sentAtWall));
+
+      // requestTxId is null while status==="sending"; skip rather than show "null".
+      if (entry.requestTxId && !String(entry.requestTxId).startsWith("local-")) {
+        appendDetailTxId(wrap, "Request TX", entry.requestTxId);
+      }
+
+      appendDetailStatus(wrap, displayStatus(entry));
+
+      // Amounts
+      appendDetailField(wrap, "Sent", entry.sentAmount + " tokens");
+      if (entry.echoAmount != null) {
+        appendDetailField(wrap, "Received", entry.echoAmount + " tokens");
+      }
+
+      // Timing breakdown (wall-clock)
+      if (entry.sentLatencyMs != null || entry.echoLatencyMs != null) {
+        const totalMs = (entry.sentLatencyMs != null && entry.echoLatencyMs != null)
+          ? entry.sentLatencyMs + entry.echoLatencyMs : null;
+        appendTimingSection(wrap, "Wall-clock latency", [
+          ["Send → confirmed", fmtMs(entry.sentLatencyMs)],
+          ["Confirmed → echo seen", fmtMs(entry.echoLatencyMs)],
+          ["Total round-trip", fmtMs(totalMs)],
+        ]);
+      }
+
+      // Server-side timing breakdown (present once echo confirms)
+      if (entry.server) {
+        appendTimingSection(wrap, "Server-side breakdown", [
+          ["Poll detect lag", fmtMs(entry.server.pollLagMs), true],
+          ["Echo build + RPC", fmtMs(entry.server.echoQueueMs), true],
+          ["Chain round-trip", fmtMs(entry.server.chainRttMs), true],
+        ]);
+      }
+
+      appendDetailBlockChips(wrap,
+        entry.requestBlockHeight, entry.requestBlockHash,
+        entry.echoBlockHeight, entry.echoBlockHash);
+
+      if (entry.retryAttempts > 0) {
+        const retryLine = document.createElement("div");
+        retryLine.className = "retry-line";
+        retryLine.textContent = "Retried " + entry.retryAttempts +
+          (entry.retryAttempts === 1 ? " time" : " times");
+        wrap.appendChild(retryLine);
+      }
+
+      const cat = entry.errorCategory;
+      const raw = entry.errorRaw || entry.error || null;
+      if (raw && (cat === "skip" || cat === "permanent" || cat === "transient")) {
+        const cls = cat === "permanent" ? "failed" : (cat === "skip" ? "skip" : "transient");
+        const msg = document.createElement("div");
+        msg.className = "latest-msg " + cls;
+        msg.textContent = friendlyError(raw);
+        wrap.appendChild(msg);
+        if (friendlyError(raw) !== raw) {
+          const detail = document.createElement("div");
+          detail.className = "err-detail";
+          detail.textContent = raw;
+          wrap.appendChild(detail);
+        }
+      }
+
+      return wrap;
+    }
+
+    // Detail panel for "Global echo log" (server-side events).
+    function buildGlobalDetail(ev) {
+      const wrap = document.createElement("div");
+
+      if (ev.requestTs != null) {
+        const ts = new Date(ev.requestTs).toLocaleString(undefined,
+          { dateStyle: "medium", timeStyle: "short" });
+        appendDetailField(wrap, "Chain time", ts);
+      }
+
+      if (ev.requestTxId) appendDetailTxId(wrap, "Request TX", ev.requestTxId);
+
+      appendDetailStatus(wrap, displayStatus(ev));
+
+      if (ev.requestAmount != null) {
+        appendDetailField(wrap, "Sent", ev.requestAmount + " tokens");
+      }
+      if (ev.echoAmount != null) {
+        appendDetailField(wrap, "Received", ev.echoAmount + " tokens");
+      }
+
+      if (ev.status === "confirmed" && ev.echoConfirmedTs != null && ev.requestTs != null) {
+        const totalMs = Math.max(0, ev.echoConfirmedTs - ev.requestTs);
+        appendTimingSection(wrap, null, [["Total round-trip", fmtMs(totalMs)]]);
+      }
+
+      appendDetailBlockChips(wrap,
+        ev.requestBlockHeight, ev.requestBlockHash,
+        ev.echoBlockHeight, ev.echoBlockHash);
+
+      const cat = ev.errorCategory;
+      const raw = ev.error || null;
+      if (raw && (ev.status === "failed" || ev.status === "skipped")) {
+        const cls = cat === "permanent" ? "failed" : (cat === "skip" ? "skip" : "transient");
+        const msg = document.createElement("div");
+        msg.className = "latest-msg " + cls;
+        msg.textContent = friendlyError(raw);
+        wrap.appendChild(msg);
+      }
+
+      return wrap;
+    }
+
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
@@ -663,6 +922,9 @@
     let globalLog = [];            // array of server event rows
     let globalCursor = null;       // nextCursor for pagination
     let globalLoading = false;
+
+    // Currently open accordion row (only one at a time).
+    let openRow = null;
 
     function purgeOldHistoryVersions() {
       try {
@@ -1319,10 +1581,11 @@
     }
 
     /* Shared row builder for both "Your attempts" and the "Global echo log".
-       `spec` is a normalized shape:
-         { sentAmount, echoAmount, statusText, totalText,
-           blockHeight, blockHash, blockLabel } */
-    function buildAttemptRow(spec) {
+       `spec`  — display-ready values: { sentAmount, echoAmount, statusText,
+                 totalText, blockHeight, blockHash, blockLabel }
+       `data`  — the full entry or event object for building the detail panel
+       `isGlobal` — true for global log rows (uses buildGlobalDetail) */
+    function buildAttemptRow(spec, data, isGlobal) {
       const row = document.createElement("div");
       row.className = "history-row";
 
@@ -1347,12 +1610,43 @@
       const chip = buildBlockChip(spec.blockLabel, spec.blockHeight, spec.blockHash);
       if (chip) right.appendChild(chip);
 
+      const chevron = document.createElement("span");
+      chevron.className = "detail-chevron";
+      chevron.textContent = "▾";
+      right.appendChild(chevron);
+
       row.appendChild(left);
       row.appendChild(right);
+
+      // Accordion detail panel — built lazily on first expand.
+      const detail = document.createElement("div");
+      detail.className = "history-detail";
+      row.appendChild(detail);
+      let detailBuilt = false;
+
+      row.addEventListener("click", (e) => {
+        // Block chips are <a> links — let them navigate without toggling.
+        if (e.target.closest("a")) return;
+        const isOpen = row.hasAttribute("data-open");
+        if (openRow && openRow !== row) openRow.removeAttribute("data-open");
+        if (isOpen) {
+          row.removeAttribute("data-open");
+          openRow = null;
+        } else {
+          if (!detailBuilt) {
+            detail.appendChild(isGlobal ? buildGlobalDetail(data) : buildLocalDetail(data));
+            detailBuilt = true;
+          }
+          row.setAttribute("data-open", "");
+          openRow = row;
+        }
+      });
+
       return row;
     }
 
     function renderHistory() {
+      openRow = null; // rows are rebuilt; any open panel is gone
       historyEl.innerHTML = "";
       if (history.length === 0) {
         const empty = document.createElement("div");
@@ -1375,7 +1669,7 @@
           blockLabel: useEcho ? "Echo" : "Request",
           blockHeight: useEcho ? h.echoBlockHeight : h.requestBlockHeight,
           blockHash: useEcho ? h.echoBlockHash : h.requestBlockHash,
-        }));
+        }, h, false));
       }
     }
 
@@ -1390,6 +1684,7 @@
     }
 
     function renderGlobalLog() {
+      openRow = null; // rows are rebuilt; any open panel is gone
       globalLogEl.innerHTML = "";
       // De-dupe against the user's own attempts (those carry richer local
       // timing); a global row whose requestTxId matches a local entry is
@@ -1413,7 +1708,7 @@
           blockLabel: useEcho ? "Echo" : "Request",
           blockHeight: useEcho ? ev.echoBlockHeight : ev.requestBlockHeight,
           blockHash: useEcho ? ev.echoBlockHash : ev.requestBlockHash,
-        }));
+        }, ev, true));
       }
     }
 
