@@ -401,23 +401,6 @@
     .block-chip .arrow { width: 10px; height: 10px; opacity: 0.7; vertical-align: middle; margin-left: 2px; flex-shrink: 0; }
     .block-chip-label { font-size: 10px; color: var(--muted); margin-right: 2px; }
 
-    /* Leaderboard table */
-    .leaderboard-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .leaderboard-table th {
-      text-align: left; color: var(--muted); font-size: 11px; font-weight: 600;
-      padding: 0 6px 8px; text-transform: uppercase; letter-spacing: 0.4px;
-    }
-    .leaderboard-table th.lb-amount,
-    .leaderboard-table th.lb-count,
-    .leaderboard-table th.lb-latency { text-align: right; }
-    .leaderboard-table tbody tr { border-top: 1px solid var(--border); }
-    .leaderboard-table td { padding: 8px 6px; }
-    .lb-rank { color: var(--muted); width: 24px; font-variant-numeric: tabular-nums; }
-    .lb-user { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .lb-amount { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .lb-count { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .leaderboard-table .lb-latency { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
@@ -752,25 +735,6 @@
         <a class="load-more" id="viewFullHistoryBtn" style="display:none;text-align:center;text-decoration:none" target="_blank" rel="noopener noreferrer">View full history ↗</a>
       </div>
 
-      <!-- Leaderboard (all-time top senders by total tokens, confirmed echoes only) -->
-      <div class="card">
-        <h2>Leaderboard</h2>
-        <div class="section-sub">Top senders by total tokens echoed.</div>
-        <table class="leaderboard-table" aria-label="Echo leaderboard">
-          <thead>
-            <tr>
-              <th class="lb-rank">#</th>
-              <th>User</th>
-              <th class="lb-amount">Total sent</th>
-              <th class="lb-count">Echoes</th>
-              <th class="lb-latency">Avg latency</th>
-            </tr>
-          </thead>
-          <tbody id="leaderboardBody">
-            <tr><td colspan="5" class="history-empty">Loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
 
       <!-- Info -->
       <div class="card info">
@@ -853,8 +817,6 @@
     const STATE_POLL_MS = 2000;
     // Global echo log + diagnostics poll cadence (slower than state poll).
     const HISTORY_POLL_MS = 5000;
-    // Leaderboard refresh cadence — rank changes infrequently.
-    const LEADERBOARD_POLL_MS = 60000;
     const GLOBAL_LOG_PAGE = 25;
     const GLOBAL_LOG_CAP = 50;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
@@ -1330,9 +1292,6 @@
     // Tracks whether the health banner is showing a latency anomaly so the
     // trend chart can tint its signal line accordingly.
     let latencyAnomaly = false;
-
-    // Leaderboard state: null = loading, false = fetch error, array = data.
-    let leaderboard = null;
 
     // Currently open accordion row (only one at a time).
     let openRow = null;
@@ -2385,77 +2344,6 @@
     function fmtLatency(ms) {
       if (ms == null || !Number.isFinite(ms)) return "—";
       return (ms / 1000).toFixed(1) + "s";
-    }
-
-    function renderLeaderboard() {
-      const tbody = document.getElementById("leaderboardBody");
-      if (!tbody) return;
-      tbody.innerHTML = "";
-      if (leaderboard === null) {
-        const tr = document.createElement("tr");
-        const td = document.createElement("td");
-        td.colSpan = 5;
-        td.className = "history-empty";
-        td.textContent = "Loading…";
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-      }
-      if (leaderboard === false) {
-        const tr = document.createElement("tr");
-        const td = document.createElement("td");
-        td.colSpan = 5;
-        td.className = "history-empty";
-        td.textContent = "Couldn't load leaderboard.";
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-      }
-      if (leaderboard.length === 0) {
-        const tr = document.createElement("tr");
-        const td = document.createElement("td");
-        td.colSpan = 5;
-        td.className = "history-empty";
-        td.textContent = "No confirmed echoes yet.";
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-      }
-      leaderboard.forEach(function (entry, i) {
-        const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
-          ? window.UsernameUsernames.getUsernameSync(entry.address)
-          : entry.address.slice(-6);
-        const tr = document.createElement("tr");
-        const cells = [
-          { cls: "lb-rank",    text: String(i + 1) },
-          { cls: "lb-user",    text: displayName },
-          { cls: "lb-amount",  text: Number(entry.tokensSent).toLocaleString() },
-          { cls: "lb-count",   text: String(entry.echoCount) },
-          { cls: "lb-latency", text: fmtLatency(entry.avgLatencyMs) },
-        ];
-        cells.forEach(function (c) {
-          const td = document.createElement("td");
-          td.className = c.cls;
-          td.textContent = c.text;
-          tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
-      });
-    }
-
-    async function refreshLeaderboard() {
-      try {
-        const r = await fetch("/__echo/leaderboard", {
-          cache: "no-store",
-          headers: authHeaders(),
-        });
-        if (!r.ok) throw new Error("leaderboard " + r.status);
-        const data = await r.json();
-        leaderboard = Array.isArray(data.entries) ? data.entries : [];
-      } catch (_) {
-        if (leaderboard === null) leaderboard = false;
-      }
-      renderLeaderboard();
     }
 
     /* ── Anomaly History panel ──────────────────────────────── */
@@ -3598,10 +3486,6 @@
       // of the newest page (loaded older pages stay put).
       refreshGlobalFirstPage();
       setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
-
-      // Leaderboard: initial fetch, then slow refresh.
-      refreshLeaderboard();
-      setInterval(refreshLeaderboard, LEADERBOARD_POLL_MS);
 
       // Your stats + personal latency chart: initial fetch + slow auto-refresh.
       renderUserStats(null, false);
