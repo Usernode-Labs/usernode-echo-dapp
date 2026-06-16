@@ -14,6 +14,7 @@
   <script src="https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js"></script>
   <script src="/usernode-usernames.js?v=__BUILD_VERSION__"></script>
   <script src="/usernode-loading.js?v=__BUILD_VERSION__"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>UsernodeLoading.init({ appName: "Echo", streamKey: "echo" });</script>
   <meta name="x-app-version" content="__BUILD_VERSION__" />
   <style>
@@ -346,6 +347,16 @@
           </div>
         </div>
         <div class="diag-meta" id="diagMeta"></div>
+      </div>
+
+      <!-- Success Rate Over Time chart -->
+      <div class="card" id="successRateCard" style="display:none">
+        <h2>Success Rate Over Time</h2>
+        <div class="section-sub">Last 24 h · hourly buckets</div>
+        <div id="successRateNoData" class="history-empty" style="display:none">No data yet</div>
+        <div id="successRateChartWrap" style="position:relative;height:200px;display:none">
+          <canvas id="successRateChart"></canvas>
+        </div>
       </div>
 
       <!-- Most recent attempt -->
@@ -1436,6 +1447,130 @@
       diagMeta.textContent = bits.join(" · ");
     }
 
+    /* ── Success Rate Over Time chart ────────────────────────── */
+    let successRateChart = null;
+    let _successRateMeta = []; // parallel array to chart data slots (null = empty hour)
+
+    function initSuccessRateChart() {
+      const canvas = document.getElementById("successRateChart");
+      if (!canvas || !window.Chart) return null;
+      const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const barColor  = isDark ? "rgba(93,211,158,0.75)"    : "rgba(15,118,110,0.75)";
+      const gridColor = isDark ? "rgba(255,255,255,0.08)"   : "rgba(0,0,0,0.06)";
+      const tickColor = isDark ? "#a8b3c7"                  : "#4b5568";
+      return new window.Chart(canvas, {
+        type: "bar",
+        data: {
+          labels: [],
+          datasets: [{
+            data: [],
+            backgroundColor: barColor,
+            borderRadius: 4,
+            borderSkipped: false,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                label: (item) => {
+                  const b = _successRateMeta[item.dataIndex];
+                  if (!b) return "No data";
+                  return b.successRate.toFixed(1) + "% · " +
+                    b.confirmed + " ok / " + b.failed + " failed / " + b.skipped + " skipped";
+                },
+              },
+            },
+          },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: {
+                color: tickColor, font: { size: 11 }, maxRotation: 0,
+                maxTicksLimit: 8,
+              },
+            },
+            y: {
+              min: 0, max: 100,
+              ticks: {
+                stepSize: 25,
+                color: tickColor,
+                font: { size: 11 },
+                callback: (v) => v + "%",
+              },
+              grid: { color: gridColor },
+            },
+          },
+        },
+      });
+    }
+
+    function updateSuccessRateChart(buckets) {
+      const card   = document.getElementById("successRateCard");
+      const noData = document.getElementById("successRateNoData");
+      const wrap   = document.getElementById("successRateChartWrap");
+      if (!card) return;
+
+      card.style.display = "block";
+
+      if (!buckets || buckets.length === 0) {
+        if (noData) noData.style.display = "block";
+        if (wrap)   wrap.style.display   = "none";
+        return;
+      }
+
+      if (noData) noData.style.display = "none";
+      if (wrap)   wrap.style.display   = "block";
+
+      if (!successRateChart) {
+        successRateChart = initSuccessRateChart();
+        if (!successRateChart) return;
+      }
+
+      // Build the 24-slot grid (current UTC hour down to 23 hours ago).
+      const now = new Date();
+      now.setUTCMinutes(0, 0, 0);
+
+      const bucketMap = new Map();
+      for (const b of buckets) bucketMap.set(b.hourStart.slice(0, 13), b);
+
+      const labels = [];
+      const data   = [];
+      _successRateMeta = [];
+
+      for (let i = 23; i >= 0; i--) {
+        const slot = new Date(now.getTime() - i * 3_600_000);
+        const key  = slot.toISOString().slice(0, 13); // "YYYY-MM-DDTHH" (UTC)
+        // Label shows local hour so users see their own timezone.
+        labels.push(slot.getHours().toString().padStart(2, "0") + ":00");
+        const b = bucketMap.get(key) || null;
+        data.push(b ? b.successRate : null);
+        _successRateMeta.push(b);
+      }
+
+      successRateChart.data.labels            = labels;
+      successRateChart.data.datasets[0].data  = data;
+      successRateChart.update("none");
+    }
+
+    async function fetchSuccessRate() {
+      try {
+        const r = await fetch("/__echo/success-rate", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.buckets)) {
+          updateSuccessRateChart(data.buckets);
+        }
+      } catch (_) {}
+    }
+
     async function fetchHistoryPage(before) {
       const params = new URLSearchParams();
       params.set("limit", String(GLOBAL_LOG_PAGE));
@@ -1757,6 +1892,10 @@
       // of the newest page (loaded older pages stay put).
       refreshGlobalFirstPage();
       setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
+
+      // Success-rate chart: same cadence as the history poll.
+      fetchSuccessRate();
+      setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).
