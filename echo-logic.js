@@ -442,6 +442,28 @@ function createEcho(opts) {
     };
   }
 
+  // Per-user latency history from the in-memory Map (DB fallback). Returns the
+  // most recent `limit` confirmed echoes in chronological order, same shape as
+  // store.queryUserLatencyHistory. Best-effort: the Map only holds ~200 global
+  // events, so older attempts for this sender may not appear.
+  function computeUserLatencyHistoryFromMemory(address, limit) {
+    if (!isValidStatsAddress(address)) return [];
+    const lim = Math.max(1, Math.min(200, limit || 50));
+    return Array.from(events.values())
+      .filter((e) =>
+        e.requestFrom === address &&
+        e.status === "confirmed" &&
+        e.echoConfirmedTs != null &&
+        e.requestTs != null
+      )
+      .sort((a, b) => (a.requestTs || 0) - (b.requestTs || 0))
+      .slice(-lim)
+      .map((e) => ({
+        ts: e.requestTs,
+        latencyMs: Math.max(0, e.echoConfirmedTs - e.requestTs),
+      }));
+  }
+
   // Newest-first list of all in-memory events as public rows (history
   // fallback when the DB is off). Sorted by request arrival time.
   function memoryHistoryList() {
@@ -1083,6 +1105,39 @@ function createEcho(opts) {
     });
   }
 
+  // Public per-user latency history: GET /__echo/my-latency-history?address=<pubkey>&limit=50.
+  // Returns individual per-echo round-trip latencies in chronological order
+  // for plotting a sparkline. Same auth posture as /__echo/my-stats (public GET).
+  async function handleUserLatencyHistory(req, res) {
+    let address = "";
+    let limit = 50;
+    try {
+      const u = new URL(req.url, "http://x");
+      address = (u.searchParams.get("address") || "").trim();
+      const lRaw = parseInt(u.searchParams.get("limit"), 10);
+      if (Number.isFinite(lRaw)) limit = Math.max(1, Math.min(200, lRaw));
+    } catch (_) {}
+
+    const cid = effectiveChainId();
+    const valid = isValidStatsAddress(address);
+
+    let points;
+    if (!valid) {
+      points = [];
+    } else if (store.isReady()) {
+      points = (await store.queryUserLatencyHistory(cid, address, limit)) ||
+               computeUserLatencyHistoryFromMemory(address, limit);
+    } else {
+      points = computeUserLatencyHistoryFromMemory(address, limit);
+    }
+
+    sendJson(req, res, {
+      address: valid ? address : null,
+      chainId: cid,
+      points,
+    });
+  }
+
   // In-memory fallback when the DB is not ready.
   function computeSuccessRateFromMemory(windowHours) {
     const cutoff  = Date.now() - windowHours * 3_600_000;
@@ -1212,6 +1267,21 @@ function createEcho(opts) {
     if (pathname === "/__echo/anomaly-history" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
       handleAnomalyHistory(req, res);
+      return true;
+    }
+    if (pathname === "/__echo/my-latency-history" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") {
+        res.writeHead(200, JSON_HEADERS);
+        res.end();
+        return true;
+      }
+      handleUserLatencyHistory(req, res).catch((e) => {
+        console.error("[echo] my-latency-history error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "my-latency-history unavailable" }));
+        }
+      });
       return true;
     }
     if (pathname === "/__echo/anomalies" && (req.method === "GET" || req.method === "HEAD")) {
