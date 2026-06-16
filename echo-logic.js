@@ -994,6 +994,12 @@ function createEcho(opts) {
     sendJson(req, res, { events: events_, nextCursor, stats, mode });
   }
 
+  async function handleLeaderboard(req, res) {
+    if (req.method === "HEAD") { res.writeHead(200); res.end(); return; }
+    const cid = effectiveChainId();
+    const entries = store.isReady() ? await store.getLeaderboard(cid) : [];
+    sendJson(req, res, { entries, chainId: cid });
+  }
 
   // Public per-user aggregate: GET /__echo/my-stats?address=<pubkey>. Same
   // posture as /__echo/state and /__echo/history (no /api/ prefix, no auth,
@@ -1188,6 +1194,16 @@ function createEcho(opts) {
       });
       return true;
     }
+    if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
+      handleLeaderboard(req, res).catch((e) => {
+        console.error("[echo] leaderboard error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "leaderboard unavailable" }));
+        }
+      });
+      return true;
+    }
     return false;
   }
 
@@ -1258,6 +1274,9 @@ function createEcho(opts) {
       if (isStaging) {
         store.seedStaging(effectiveChainId()).catch((e) => {
           console.error("[echo] staging seed error:", e.message);
+        });
+        store.seedStagingLeaderboard(effectiveChainId()).catch((e) => {
+          console.warn("[echo] staging leaderboard seed failed:", e.message);
         });
       }
     })();
