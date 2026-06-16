@@ -775,7 +775,7 @@
       <!-- Info -->
       <div class="card info">
         <h2>How this works</h2>
-        <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the sidecar's <code>/wallet/send</code> RPC to return <code>N-1</code> tokens.</p>
+        <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the secure wallet protocol to return <code>N-1</code> tokens.</p>
         <p>The wall-clock numbers above measure your phone's view of the round-trip; the server-side breakdown shows where the time is going (poll lag → RPC submit → chain confirmation).</p>
         <p>The <strong>Global echo log</strong> is a shared, public diagnostic feed recorded by the server, while <strong>Your attempts</strong> are stored only in this browser on this device.</p>
       </div>
