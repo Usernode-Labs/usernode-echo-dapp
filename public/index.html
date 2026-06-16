@@ -661,6 +661,12 @@
             <div class="val" id="yourStatsMax">—</div>
           </div>
         </div>
+        <div class="timing-section" id="yourLatencySection" style="display:none">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your latency</div>
+          <div style="position:relative;height:80px">
+            <canvas id="yourLatencyChart"></canvas>
+          </div>
+        </div>
         <div class="diag-meta" id="yourStatsMeta"></div>
       </div>
 
@@ -2711,6 +2717,117 @@
       latencyChart.update("none");
     }
 
+    /* ── Personal latency history mini-chart ────────────────── */
+    let userLatencyChart = null;
+
+    function initUserLatencyChart() {
+      const canvas = document.getElementById("yourLatencyChart");
+      if (!canvas || !window.Chart) return null;
+      return new window.Chart(canvas, {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              // Per-echo latency line
+              data: [],
+              borderColor: "#a78bfa",        // --accent-text
+              borderWidth: 1.5,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              pointBackgroundColor: (ctx) => {
+                const v = ctx.raw;
+                if (v == null) return "transparent";
+                if (v < 2000) return "rgba(52,211,153,0.9)";   // --ok
+                if (v < 5000) return "rgba(251,191,36,0.9)";   // --warn
+                return "rgba(251,113,133,0.9)";                 // --err
+              },
+              pointBorderColor: "transparent",
+              tension: 0.3,
+              fill: false,
+            },
+            {
+              // Average reference line (dashed, no points, no tooltip)
+              data: [],
+              borderColor: "rgba(154,161,186,0.5)",  // --muted at half opacity
+              borderWidth: 1,
+              borderDash: [4, 4],
+              pointRadius: 0,
+              pointHoverRadius: 0,
+              tension: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              filter: (item) => item.datasetIndex === 0,
+              callbacks: {
+                label: (item) => {
+                  const lat = item.raw;
+                  const ts = item.chart.data._timestamps && item.chart.data._timestamps[item.dataIndex];
+                  const dateStr = ts
+                    ? new Date(ts).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+                    : "";
+                  return fmtMs(lat) + (dateStr ? " · " + dateStr : "");
+                },
+              },
+            },
+          },
+          scales: {
+            x: { display: false },
+            y: { display: false },
+          },
+        },
+      });
+    }
+
+    function updateUserLatencyChart(points) {
+      const section = document.getElementById("yourLatencySection");
+      if (!section) return;
+      if (!points || points.length < 3) {
+        section.style.display = "none";
+        return;
+      }
+      section.style.display = "block";
+      if (!userLatencyChart) {
+        userLatencyChart = initUserLatencyChart();
+        if (!userLatencyChart) return;
+      }
+      const latencies = points.map((p) => p.latencyMs);
+      const timestamps = points.map((p) => p.ts);
+      const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+      const avgLine = latencies.map(() => avg);
+      userLatencyChart.data.labels = latencies.map((_, i) => i);
+      userLatencyChart.data._timestamps = timestamps;
+      userLatencyChart.data.datasets[0].data = latencies;
+      userLatencyChart.data.datasets[1].data = avgLine;
+      userLatencyChart.update("none");
+    }
+
+    async function pollUserLatencyHistory() {
+      if (!myStatsAddress) myStatsAddress = await resolveMyStatsAddress();
+      if (!myStatsAddress) return;
+      try {
+        const params = new URLSearchParams();
+        params.set("address", myStatsAddress);
+        params.set("limit", "50");
+        if (IS_DEMO) params.set("demo", "1");
+        const r = await fetch("/__echo/my-latency-history?" + params.toString(), {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        updateUserLatencyChart(Array.isArray(data.points) ? data.points : []);
+      } catch (_) { /* transient — next tick retries */ }
+    }
+
     async function fetchHistoryPage(before) {
       const params = new URLSearchParams();
       params.set("limit", String(GLOBAL_LOG_PAGE));
@@ -3233,10 +3350,11 @@
       refreshLeaderboard();
       setInterval(refreshLeaderboard, LEADERBOARD_POLL_MS);
 
-      // Your stats: initial fetch + slow auto-refresh on the same cadence.
+      // Your stats + personal latency chart: initial fetch + slow auto-refresh.
       renderUserStats(null, false);
       pollUserStats();
-      setInterval(pollUserStats, HISTORY_POLL_MS);
+      pollUserLatencyHistory();
+      setInterval(() => { pollUserStats(); pollUserLatencyHistory(); }, HISTORY_POLL_MS);
 
       // Success-rate chart: same cadence as the history poll.
       fetchSuccessRate();
