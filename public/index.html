@@ -404,6 +404,33 @@
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
+    /* Anomaly history panel */
+    .anomaly-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .anomaly-table th {
+      text-align: left; color: var(--muted); font-size: 11px; font-weight: 600;
+      padding: 0 6px 8px; text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .anomaly-table tbody tr { border-top: 1px solid var(--border); }
+    .anomaly-table td { padding: 8px 6px; vertical-align: top; }
+    .anomaly-table td.an-when { white-space: nowrap; color: var(--muted); font-size: 12px; min-width: 56px; }
+    .anomaly-table td.an-what { white-space: nowrap; }
+    .anomaly-table td.an-sev  { white-space: nowrap; }
+    .anomaly-table td.an-st   { white-space: nowrap; }
+    .anomaly-table td.an-note { color: var(--muted); font-size: 12px; word-break: break-word; }
+    .anomaly-table td.an-dur  { white-space: nowrap; color: var(--muted); font-size: 12px; text-align: right; }
+    .anomaly-badge {
+      display: inline-block; font-size: 11px; font-weight: 600;
+      padding: 2px 7px; border-radius: 999px; line-height: 1.5;
+      letter-spacing: 0.2px;
+    }
+    .anomaly-sev-warn     { background: rgba(251, 191, 36, 0.15);  color: var(--warn); }
+    .anomaly-sev-critical { background: rgba(251, 113, 133, 0.16); color: var(--err); }
+    .anomaly-st-open      { background: rgba(251, 113, 133, 0.16); color: var(--err);
+                            animation: echoPulse 1.4s ease-in-out infinite; }
+    .anomaly-st-resolved  { background: var(--border); color: var(--muted); }
+    .anomaly-open-badge   { font-size: 12px; font-weight: 600; color: var(--err); margin-left: 6px; }
+    .anomaly-ok           { font-size: 13px; color: var(--ok); text-align: center; padding: 12px 0; }
+
     /* Leaderboard card */
     .lb-row {
       display: grid;
@@ -590,6 +617,13 @@
         </div>
       </div>
 
+      <!-- Anomaly History — system-health events detected by the server -->
+      <div class="card" id="anomalyHistoryCard">
+        <h2>Anomaly History<span class="anomaly-open-badge" id="anomalyOpenBadge" style="display:none"></span></h2>
+        <div class="section-sub">Server-detected anomalies — latency spikes, failure bursts, stalls.</div>
+        <div id="anomalyHistoryTable"><div class="anomaly-ok">✓ No anomalies detected</div></div>
+      </div>
+
       <!-- Most recent attempt -->
       <div class="card" id="latestCard" style="display:none">
         <h2>Latest attempt <span class="status" id="latestStatus">pending</span><span class="auto-refresh-dot" id="autoRefreshDot" style="display:none"></span></h2>
@@ -698,13 +732,14 @@
         <div class="section-sub">Recent echoes across every viewer — survives restarts.</div>
         <div id="globalLog"></div>
         <button class="load-more" id="loadMoreBtn" style="display:none">Load more</button>
+        <a class="load-more" id="viewFullHistoryBtn" style="display:none;text-align:center;text-decoration:none" target="_blank" rel="noopener noreferrer">View full history ↗</a>
       </div>
 
 
       <!-- Info -->
       <div class="card info">
         <h2>How this works</h2>
-        <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the sidecar's <code>/wallet/send</code> RPC to return <code>N-1</code> tokens.</p>
+        <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the secure wallet protocol to return <code>N-1</code> tokens.</p>
         <p>The wall-clock numbers above measure your phone's view of the round-trip; the server-side breakdown shows where the time is going (poll lag → RPC submit → chain confirmation).</p>
         <p>The <strong>Global echo log</strong> is a shared, public diagnostic feed recorded by the server, while <strong>Your attempts</strong> are stored only in this browser on this device.</p>
       </div>
@@ -783,6 +818,7 @@
     // Global echo log + diagnostics poll cadence (slower than state poll).
     const HISTORY_POLL_MS = 5000;
     const GLOBAL_LOG_PAGE = 25;
+    const GLOBAL_LOG_CAP = 50;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
 
     // "Your stats" (per-user aggregate) config. In staging the page can be
@@ -1213,6 +1249,10 @@
     exportCsvBtn.addEventListener("click", exportCsv);
     const globalLogEl = document.getElementById("globalLog");
     const loadMoreBtn = document.getElementById("loadMoreBtn");
+    const viewFullHistoryBtn = document.getElementById("viewFullHistoryBtn");
+    if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) {
+      viewFullHistoryBtn.href = EXPLORER_PUBLIC_BASE + "/address/" + APP_PUBKEY;
+    }
     const diagCard = document.getElementById("diagCard");
     const diagSuccess = document.getElementById("diagSuccess");
     const diagMedian = document.getElementById("diagMedian");
@@ -2306,6 +2346,115 @@
       return (ms / 1000).toFixed(1) + "s";
     }
 
+    /* ── Anomaly History panel ──────────────────────────────── */
+    function fmtRelTime(ms) {
+      const diffMs = Date.now() - ms;
+      const secs = Math.floor(diffMs / 1000);
+      if (secs < 60) return secs + "s ago";
+      const mins = Math.floor(secs / 60);
+      if (mins < 60) return mins + "m ago";
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return hrs + "h ago";
+      return Math.floor(hrs / 24) + "d ago";
+    }
+
+    function fmtDuration(ms) {
+      if (ms == null || ms < 0) return "—";
+      const totalSecs = Math.floor(ms / 1000);
+      const mins = Math.floor(totalSecs / 60);
+      const secs = totalSecs % 60;
+      if (mins === 0) return secs + "s";
+      return mins + "m " + secs + "s";
+    }
+
+    function renderAnomalyHistory(data) {
+      const tableEl = document.getElementById("anomalyHistoryTable");
+      const badgeEl = document.getElementById("anomalyOpenBadge");
+      if (!tableEl) return;
+
+      if (data.openCount > 0) {
+        badgeEl.textContent = "· " + data.openCount + " open";
+        badgeEl.style.display = "inline";
+      } else {
+        badgeEl.style.display = "none";
+      }
+
+      if (!data.anomalies || data.anomalies.length === 0) {
+        tableEl.innerHTML = "<div class=\"anomaly-ok\">✓ No anomalies detected</div>";
+        return;
+      }
+
+      const table = document.createElement("table");
+      table.className = "anomaly-table";
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th>When</th><th>What</th><th>Severity</th><th>Status</th><th>Description</th><th style=\"text-align:right\">Duration</th></tr>";
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      data.anomalies.forEach(function (a) {
+        const tr = document.createElement("tr");
+
+        const when = document.createElement("td");
+        when.className = "an-when";
+        when.textContent = fmtRelTime(a.openedAtMs);
+
+        const what = document.createElement("td");
+        what.className = "an-what";
+        what.textContent = a.metricLabel || a.metric;
+
+        const sev = document.createElement("td");
+        sev.className = "an-sev";
+        const sevBadge = document.createElement("span");
+        sevBadge.className = "anomaly-badge anomaly-sev-" + (a.severity || "warn");
+        sevBadge.textContent = a.severity || "warn";
+        sev.appendChild(sevBadge);
+
+        const st = document.createElement("td");
+        st.className = "an-st";
+        const stBadge = document.createElement("span");
+        stBadge.className = "anomaly-badge anomaly-st-" + a.status;
+        stBadge.textContent = a.status;
+        st.appendChild(stBadge);
+
+        const note = document.createElement("td");
+        note.className = "an-note";
+        note.textContent = a.note || "";
+
+        const dur = document.createElement("td");
+        dur.className = "an-dur";
+        if (a.status === "open") {
+          const ageMs = Date.now() - a.openedAtMs;
+          dur.textContent = "ongoing (" + fmtDuration(ageMs) + ")";
+        } else {
+          const durationMs = a.resolvedAtMs != null ? a.resolvedAtMs - a.openedAtMs : null;
+          dur.textContent = fmtDuration(durationMs);
+        }
+
+        tr.appendChild(when);
+        tr.appendChild(what);
+        tr.appendChild(sev);
+        tr.appendChild(st);
+        tr.appendChild(note);
+        tr.appendChild(dur);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      tableEl.innerHTML = "";
+      tableEl.appendChild(table);
+    }
+
+    async function fetchAnomalyHistory() {
+      try {
+        const r = await fetch("/__echo/anomaly-history", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.anomalies)) renderAnomalyHistory(data);
+      } catch (_) {}
+    }
+
     function renderDiagnostics(stats) {
       if (!stats) { diagCard.style.display = "none"; return; }
       diagCard.style.display = "block";
@@ -2842,7 +2991,12 @@
         if (wasEmpty) globalCursor = data.nextCursor || null;
         renderGlobalLog();
         renderDiagnostics(data.stats);
-        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        if (globalLog.length >= GLOBAL_LOG_CAP) {
+          if (loadMoreBtn) loadMoreBtn.style.display = "none";
+          if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) viewFullHistoryBtn.style.display = "block";
+        } else {
+          if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        }
 
         if (metricsResp && metricsResp.series) {
           renderTrendChart(metricsResp.series.chain_rtt_ms, latencyAnomaly);
@@ -2866,10 +3020,17 @@
           const seen = new Set(globalLog.map((e) => e.requestTxId));
           for (const ev of data.events) if (!seen.has(ev.requestTxId)) globalLog.push(ev);
         }
+        if (globalLog.length > GLOBAL_LOG_CAP) globalLog.length = GLOBAL_LOG_CAP;
         globalCursor = data.nextCursor || null;
         renderGlobalLog();
         renderDiagnostics(data.stats);
-        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        if (globalLog.length >= GLOBAL_LOG_CAP) {
+          globalCursor = null;
+          if (loadMoreBtn) loadMoreBtn.style.display = "none";
+          if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) viewFullHistoryBtn.style.display = "block";
+        } else {
+          if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        }
       } catch (_) {
         /* ignore — user can retry */
       } finally {
@@ -3339,6 +3500,10 @@
       // Leaderboard: initial fetch + 30s auto-refresh.
       pollLeaderboard();
       setInterval(pollLeaderboard, 30000);
+
+      // Anomaly history: initial fetch + slow refresh (same cadence as leaderboard).
+      fetchAnomalyHistory();
+      setInterval(fetchAnomalyHistory, LEADERBOARD_POLL_MS);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).
