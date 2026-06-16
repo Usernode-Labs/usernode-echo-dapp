@@ -24,6 +24,35 @@ const createEchoMetrics = require("./lib/echo-metrics");
 
 const APP_ID = "echo";
 
+// Well-known, obviously-fake sender used only by the staging "Your stats" demo
+// seed (see echo-store.seedStagingDemo). The client switches to this address
+// when loaded with ?demo=1 so a tester can see populated stats regardless of
+// which wallet they're signed in with. Never seeded outside staging.
+const DEMO_STATS_PUBKEY =
+  "ut1stagingdemoecho000000000000000000000000000000000000000demo0";
+
+// Minimal address sanity check for /__echo/my-stats. We never trust the param
+// for anything but a scoped read of already-public data, so this only guards
+// against junk; it intentionally does not assert a full pubkey format.
+function isValidStatsAddress(a) {
+  return typeof a === "string" && a.length >= 8 && a.length <= 200 && /^ut1/i.test(a);
+}
+
+// Zeroed per-user stats payload (missing/invalid address, or no data).
+function emptyUserStats() {
+  return {
+    total: 0,
+    confirmed: 0,
+    failed: 0,
+    skipped: 0,
+    inFlight: 0,
+    successRate: null,
+    avgTotalMs: null,
+    minTotalMs: null,
+    maxTotalMs: null,
+  };
+}
+
 function parseMemo(m) {
   if (m == null) return null;
   const s = String(m).trim();
@@ -125,7 +154,10 @@ function createEcho(opts) {
   // Durable write-through mirror of the in-memory `events` Map. Disabled
   // (no-op) when DATABASE_URL is absent or the DB is unreachable — echo then
   // runs in-memory only, exactly as before.
-  const store = opts.store || createEchoStore({ databaseUrl: opts.databaseUrl });
+  const store = opts.store || createEchoStore({
+    databaseUrl: opts.databaseUrl,
+    isStaging: !!opts.isStaging,
+  });
 
   // Active chain id, used to stamp/scope durable rows. Set by the surrounding
   // server wiring (initial discovery + onChainReset). Mock mode has no chain,
@@ -377,6 +409,36 @@ function createEcho(opts) {
       medianTotalMs: percentile(totals, 0.5),
       p95TotalMs: percentile(totals, 0.95),
       medianServerEchoQueueMs: percentile(queues, 0.5),
+    };
+  }
+
+  // Per-user aggregate over the in-memory events Map (fallback when the DB is
+  // off). Same shape as store.queryUserStats. Note: the Map only holds the most
+  // recent ~200 global events, so older attempts for this sender won't be
+  // counted without the durable store — best-effort, mirroring how the global
+  // stats degrade.
+  function computeUserStatsFromMemory(address) {
+    if (!isValidStatsAddress(address)) return emptyUserStats();
+    const mine = Array.from(events.values()).filter((e) => e.requestFrom === address);
+    const confirmed = mine.filter((e) => e.status === "confirmed");
+    const failed = mine.filter((e) => e.status === "failed").length;
+    const skipped = mine.filter((e) => e.status === "skipped").length;
+    const inFlight = mine.filter((e) => e.status === "pending" || e.status === "echoing").length;
+    const total = confirmed.length + failed + skipped;
+    const lat = confirmed
+      .filter((e) => e.echoConfirmedTs != null && e.requestTs != null)
+      .map((e) => Math.max(0, e.echoConfirmedTs - e.requestTs));
+    const sum = lat.reduce((a, b) => a + b, 0);
+    return {
+      total,
+      confirmed: confirmed.length,
+      failed,
+      skipped,
+      inFlight,
+      successRate: total > 0 ? confirmed.length / total : null,
+      avgTotalMs: lat.length ? sum / lat.length : null,
+      minTotalMs: lat.length ? Math.min(...lat) : null,
+      maxTotalMs: lat.length ? Math.max(...lat) : null,
     };
   }
 
@@ -933,6 +995,39 @@ function createEcho(opts) {
   }
 
 
+  // Public per-user aggregate: GET /__echo/my-stats?address=<pubkey>. Same
+  // posture as /__echo/state and /__echo/history (no /api/ prefix, no auth,
+  // no-store). Scopes to the current chain. The address is caller-supplied;
+  // it's only ever used to read already-public data (every request_from is
+  // visible via the global log), so there's no auth/identity dependency.
+  async function handleUserStats(req, res) {
+    let address = "";
+    try {
+      const u = new URL(req.url, "http://x");
+      address = (u.searchParams.get("address") || "").trim();
+    } catch (_) {}
+
+    const cid = effectiveChainId();
+    const mode = localDev ? "mock" : "chain";
+    const valid = isValidStatsAddress(address);
+
+    let stats;
+    if (!valid) {
+      stats = emptyUserStats();
+    } else if (store.isReady()) {
+      stats = (await store.queryUserStats(cid, address, 1000)) || computeUserStatsFromMemory(address);
+    } else {
+      stats = computeUserStatsFromMemory(address);
+    }
+
+    sendJson(req, res, {
+      address: valid ? address : null,
+      chainId: cid,
+      mode,
+      ...stats,
+    });
+  }
+
   // In-memory fallback when the DB is not ready.
   function computeSuccessRateFromMemory(windowHours) {
     const cutoff  = Date.now() - windowHours * 3_600_000;
@@ -981,6 +1076,21 @@ function createEcho(opts) {
   }
 
   function handleRequest(req, res, pathname) {
+    if (pathname === "/__echo/my-stats" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") {
+        res.writeHead(200, JSON_HEADERS);
+        res.end();
+        return true;
+      }
+      handleUserStats(req, res).catch((e) => {
+        console.error("[echo] my-stats error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "my-stats unavailable" }));
+        }
+      });
+      return true;
+    }
     if (pathname === "/__echo/anomalies" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200); res.end(); return true; }
       sendOperatorJson(res, metrics.getAnomaliesResponse());
@@ -1052,6 +1162,16 @@ function createEcho(opts) {
     // app-specific tasks here.
     (async () => {
       await store.init();
+      // Staging-only: seed a small set of demo echoes for the "Your stats"
+      // card so a fresh preview renders non-trivial per-user numbers. No-op in
+      // production / local-dev and idempotent across container rebuilds.
+      if (opts.isStaging) {
+        try {
+          await store.seedStagingDemo(effectiveChainId(), DEMO_STATS_PUBKEY);
+        } catch (e) {
+          console.error("[echo] staging seed failed:", e.message);
+        }
+      }
       // Warm the in-memory Map from the durable log so /__echo/state and the
       // history endpoint aren't empty right after a restart. Inert: no timers,
       // no re-sends. handleIncoming/handleOutgoing short-circuit on
@@ -1127,7 +1247,17 @@ function createEcho(opts) {
     reset,
     setChainId,
     appPubkey,
+    // Test seam: direct access to the in-memory event map and the per-user
+    // aggregate so the fallback path can be exercised without a live DB.
+    _test: {
+      events,
+      computeUserStatsFromMemory,
+      handleUserStats,
+    },
   };
 }
 
 module.exports = createEcho;
+module.exports.DEMO_STATS_PUBKEY = DEMO_STATS_PUBKEY;
+module.exports.isValidStatsAddress = isValidStatsAddress;
+module.exports.emptyUserStats = emptyUserStats;

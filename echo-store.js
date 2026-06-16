@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS echo_events (
 );
 CREATE INDEX IF NOT EXISTS echo_events_created_at_idx ON echo_events (created_at DESC);
 CREATE INDEX IF NOT EXISTS echo_events_chain_created_idx ON echo_events (chain_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS echo_events_chain_from_idx ON echo_events (chain_id, request_from);
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -193,9 +194,13 @@ function decodeCursor(cursor) {
 
 function createEchoStore(opts = {}) {
   const databaseUrl = opts.databaseUrl || process.env.DATABASE_URL || "";
+  const isStaging = !!opts.isStaging;
+  // Test seam: allow injecting a fake pool (e.g. a stub exposing `query`) so
+  // queryUserStats / persist can be unit-tested without a live Postgres.
+  const injectedPool = opts.pool || null;
   let pool = null;
   let ready = false;
-  let disabled = !databaseUrl || !Pool;
+  let disabled = injectedPool ? false : (!databaseUrl || !Pool);
   let pruneTimer = null;
 
   function isReady() {
@@ -208,8 +213,12 @@ function createEchoStore(opts = {}) {
       return false;
     }
     try {
-      pool = new Pool({ connectionString: databaseUrl, max: 4 });
-      pool.on("error", (e) => console.error("[echo-store] pool error:", e.message));
+      if (injectedPool) {
+        pool = injectedPool;
+      } else {
+        pool = new Pool({ connectionString: databaseUrl, max: 4 });
+        pool.on("error", (e) => console.error("[echo-store] pool error:", e.message));
+      }
       await pool.query(CREATE_SQL);
       ready = true;
       console.log("[echo-store] ready (echo_events table ensured)");
@@ -312,6 +321,131 @@ function createEchoStore(opts = {}) {
       p95TotalMs: numOrNull(row.p95_total),
       medianServerEchoQueueMs: numOrNull(row.median_queue),
     };
+  }
+
+  // Per-user aggregate over a single sender's echoes on the current chain.
+  // Mirrors queryStats but scopes WHERE request_from = $2 and returns
+  // avg/min/max round-trip (instead of percentiles). Latencies clamp negative
+  // chain-vs-server skew to 0. Returns null when disabled (caller falls back
+  // to the in-memory computation).
+  async function queryUserStats(chainId, address, windowSize = 1000) {
+    if (!isReady() || !address) return null;
+    const lim = Math.max(1, Math.min(5000, windowSize || 1000));
+    const sql = `
+      WITH recent AS (
+        SELECT * FROM echo_events
+        WHERE chain_id = $1 AND request_from = $2
+        ORDER BY created_at DESC
+        LIMIT $3
+      )
+      SELECT
+        count(*) FILTER (WHERE status IN ('confirmed','failed','skipped'))::int AS total,
+        count(*) FILTER (WHERE status='confirmed')::int AS confirmed,
+        count(*) FILTER (WHERE status='failed')::int AS failed,
+        count(*) FILTER (WHERE status='skipped')::int AS skipped,
+        count(*) FILTER (WHERE status IN ('pending','echoing'))::int AS in_flight,
+        avg(GREATEST(echo_confirmed_ts - request_ts, 0))
+          FILTER (WHERE status='confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL) AS avg_total,
+        min(GREATEST(echo_confirmed_ts - request_ts, 0))
+          FILTER (WHERE status='confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL) AS min_total,
+        max(GREATEST(echo_confirmed_ts - request_ts, 0))
+          FILTER (WHERE status='confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL) AS max_total
+      FROM recent`;
+    const r = await pool.query(sql, [chainId || null, address, lim]);
+    const row = r.rows[0] || {};
+    const total = row.total || 0;
+    const confirmed = row.confirmed || 0;
+    return {
+      total,
+      confirmed,
+      failed: row.failed || 0,
+      skipped: row.skipped || 0,
+      inFlight: row.in_flight || 0,
+      successRate: total > 0 ? confirmed / total : null,
+      avgTotalMs: numOrNull(row.avg_total),
+      minTotalMs: numOrNull(row.min_total),
+      maxTotalMs: numOrNull(row.max_total),
+    };
+  }
+
+  // Staging-only demo seed for the "Your stats" card. Inserts a small, fixed
+  // set of obviously-fake echo_events for a single demo sender so the per-user
+  // aggregate renders non-trivially in a fresh staging preview (production
+  // ships with no rows for the demo address). Idempotent: bails if the demo
+  // sender already has rows. Strict no-op outside staging.
+  async function seedStagingDemo(chainId, address) {
+    if (!isReady() || !isStaging || !address) return;
+    try {
+      const existing = await pool.query(
+        `SELECT 1 FROM echo_events WHERE request_from = $1 LIMIT 1`,
+        [address]
+      );
+      if (existing.rowCount > 0) return;
+
+      // Fixed base epoch so re-seeds are deterministic (ON CONFLICT also guards).
+      const base = 1700000000000;
+      const specs = [];
+      // 20 confirmed echoes with spread latencies (1.2s … 8.9s) so avg/min/max differ.
+      for (let i = 0; i < 20; i++) {
+        const reqTs = base + i * 60000;
+        const latency = 1200 + (i % 8) * 1100;
+        specs.push({
+          id: `staging-demo-echo-conf-${String(i).padStart(2, "0")}`,
+          status: "confirmed", reqTs, echoTs: reqTs + latency,
+          amount: 5, echoAmount: 4, error: null, errorCategory: null,
+        });
+      }
+      // 3 permanent failures.
+      for (let i = 0; i < 3; i++) {
+        const reqTs = base + (20 + i) * 60000;
+        specs.push({
+          id: `staging-demo-echo-fail-${i}`,
+          status: "failed", reqTs, echoTs: null,
+          amount: 5, echoAmount: null,
+          error: "Staging demo: send rejected", errorCategory: "permanent",
+        });
+      }
+      // 1 skipped (amount < 2).
+      specs.push({
+        id: "staging-demo-echo-skip-0",
+        status: "skipped", reqTs: base + 23 * 60000, echoTs: null,
+        amount: 1, echoAmount: null,
+        error: "amount must be ≥ 2 (echo returns N-1)", errorCategory: "skip",
+      });
+      // 1 in-flight (echoing) so the meta line shows a live attempt.
+      specs.push({
+        id: "staging-demo-echo-flight-0",
+        status: "echoing", reqTs: base + 24 * 60000, echoTs: null,
+        amount: 5, echoAmount: 4, error: null, errorCategory: null,
+      });
+
+      for (const s of specs) {
+        const ev = {
+          requestTxId: s.id,
+          requestFrom: address,
+          requestAmount: s.amount,
+          echoAmount: s.echoAmount,
+          status: s.status,
+          error: s.error,
+          errorCategory: s.errorCategory,
+          retryAttempts: 0,
+          requestTs: s.reqTs,
+          requestSeenAtServerMs: s.reqTs,
+          echoSentAtServerMs: s.echoTs != null ? s.reqTs + 200 : null,
+          echoTxId: s.echoTs != null ? s.id + "-out" : null,
+          echoConfirmedTs: s.echoTs,
+          echoConfirmedAtServerMs: s.echoTs,
+          requestBlockHeight: null,
+          requestBlockHash: null,
+          echoBlockHeight: null,
+          echoBlockHash: null,
+        };
+        await pool.query(UPSERT_SQL, eventToParams(ev, chainId));
+      }
+      console.log(`[echo-store] seeded ${specs.length} staging demo echo_events for ${address.slice(0, 16)}…`);
+    } catch (e) {
+      console.error("[echo-store] staging seed error:", e.message);
+    }
   }
 
   async function prune() {
@@ -539,8 +673,8 @@ function createEchoStore(opts = {}) {
     }
   }
 
-  return { init, isReady, persist, hydrate, queryHistory, queryStats,
-           getSuccessRateBuckets, seedStaging, prune, close };
+  return { init, isReady, persist, hydrate, queryHistory, queryStats, queryUserStats,
+           getSuccessRateBuckets, seedStagingDemo, seedStaging, prune, close };
 }
 
 module.exports = createEchoStore;
