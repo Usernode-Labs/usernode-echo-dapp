@@ -1571,6 +1571,20 @@
       const timer = setTimeout(dismiss, durationMs);
     }
 
+    /* ── Browser notifications ──────────────────────────────── */
+    function requestNotificationPermission() {
+      if (!("Notification" in window) || Notification.permission !== "default") return;
+      Notification.requestPermission();
+    }
+
+    function fireEchoNotification(totalMs) {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const opts = {};
+      if (totalMs != null) opts.body = "Round trip: " + (totalMs / 1000).toFixed(2) + "s";
+      const n = new Notification("Echo received", opts);
+      n.onclick = () => { window.focus(); n.close(); };
+    }
+
     /* ── Available balance (powers the Max button) ─────────── */
     // There is no balance API on this stack — the bridge exposes only
     // getNodeAddress / sendTransaction / signMessage / getTransactions. So we
@@ -1784,6 +1798,8 @@
       };
       const timeoutPromise = new Promise((_, reject) => { timeoutReject = reject; });
       armSendTimeout(SEND_TIMEOUT_BACKSTOP_MS);
+
+      requestNotificationPermission();
 
       let result = null;
       try {
@@ -2967,6 +2983,7 @@
           const rttTxt = entry.totalLatencyMs != null
             ? " — " + (entry.totalLatencyMs / 1000).toFixed(2) + "s round trip" : "";
           showToast("success", "Echo received" + rttTxt, 5000);
+          fireEchoNotification(entry.totalLatencyMs);
         } else if (ev.status === "echoing" && entry.status !== "echoing") {
           entry.status = "echoing";
           entry.errorCategory = null;
