@@ -1037,14 +1037,25 @@ function createEcho(opts) {
       const ts = ev.requestSeenAtServerMs || ev.requestTs;
       if (!ts || ts < cutoff) continue;
       const hourMs = Math.floor(ts / 3_600_000) * 3_600_000;
-      if (!buckets.has(hourMs)) buckets.set(hourMs, { confirmed: 0, failed: 0, skipped: 0 });
+      if (!buckets.has(hourMs)) buckets.set(hourMs, { confirmed: 0, failed: 0, skipped: 0, latencies: [] });
       const b = buckets.get(hourMs);
       b[ev.status]++;
+      if (ev.status === "confirmed" && ev.echoConfirmedTs != null && ev.requestTs != null) {
+        b.latencies.push(Math.max(0, ev.echoConfirmedTs - ev.requestTs));
+      }
     }
     return Array.from(buckets.entries())
       .sort(([a], [b]) => a - b)
       .map(([hourMs, b]) => {
         const total = b.confirmed + b.failed + b.skipped;
+        let medianLatencyMs = null;
+        if (b.latencies.length > 0) {
+          const sorted = b.latencies.slice().sort((a, c) => a - c);
+          const mid = Math.floor(sorted.length / 2);
+          medianLatencyMs = sorted.length % 2 !== 0
+            ? sorted[mid]
+            : (sorted[mid - 1] + sorted[mid]) / 2;
+        }
         return {
           hourStart: new Date(hourMs).toISOString(),
           confirmed: b.confirmed,
@@ -1052,8 +1063,37 @@ function createEcho(opts) {
           skipped: b.skipped,
           total,
           successRate: total > 0 ? Math.round((b.confirmed / total) * 1000) / 10 : null,
+          medianLatencyMs,
         };
       });
+  }
+
+  // In-memory leaderboard fallback: aggregate confirmed events from the Map.
+  function computeLeaderboardFromMemory(limit) {
+    const lim = Math.max(1, Math.min(100, limit || 20));
+    const byAddress = new Map();
+    for (const ev of events.values()) {
+      if (ev.status !== "confirmed") continue;
+      const addr = ev.requestFrom;
+      if (!addr) continue;
+      if (!byAddress.has(addr)) byAddress.set(addr, { tokensSent: 0, echoCount: 0, latSum: 0, latCount: 0 });
+      const a = byAddress.get(addr);
+      a.tokensSent += ev.requestAmount || 0;
+      a.echoCount++;
+      if (ev.echoConfirmedTs != null && ev.requestTs != null) {
+        a.latSum += Math.max(0, ev.echoConfirmedTs - ev.requestTs);
+        a.latCount++;
+      }
+    }
+    return Array.from(byAddress.entries())
+      .map(([address, a]) => ({
+        address,
+        tokensSent: a.tokensSent,
+        echoCount: a.echoCount,
+        avgLatencyMs: a.latCount > 0 ? a.latSum / a.latCount : null,
+      }))
+      .sort((a, b) => b.tokensSent - a.tokensSent)
+      .slice(0, lim);
   }
 
   async function handleSuccessRate(req, res) {
@@ -1075,7 +1115,30 @@ function createEcho(opts) {
     sendJson(req, res, { buckets, windowHours });
   }
 
+  async function handleLeaderboard(req, res) {
+    const cid  = effectiveChainId();
+    const mode = localDev ? "mock" : "chain";
+    let entries;
+    if (store.isReady()) {
+      entries = await store.queryLeaderboard(cid, 20);
+    } else {
+      entries = computeLeaderboardFromMemory(20);
+    }
+    sendJson(req, res, { entries, chainId: cid, count: entries.length, mode });
+  }
+
   function handleRequest(req, res, pathname) {
+    if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
+      handleLeaderboard(req, res).catch((e) => {
+        console.error("[echo] leaderboard error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "leaderboard unavailable" }));
+        }
+      });
+      return true;
+    }
     if (pathname === "/__echo/my-stats" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") {
         res.writeHead(200, JSON_HEADERS);
