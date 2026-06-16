@@ -397,6 +397,36 @@
         <div class="err-detail" id="latestErrDetail" style="display:none"></div>
       </div>
 
+      <!-- Your stats — per-user aggregate from /__echo/my-stats, scoped to
+           the signed-in wallet (survives across devices). -->
+      <div class="card" id="yourStatsCard">
+        <h2>Your stats</h2>
+        <div class="section-sub">This wallet's echoes — across every device.</div>
+        <div class="diag-grid">
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsTotal">—</div>
+            <div class="diag-label">Total echoes</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsSuccess">—</div>
+            <div class="diag-label">Success rate</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="yourStatsAvg">—</div>
+            <div class="diag-label">Avg round-trip</div>
+          </div>
+        </div>
+        <div class="timing-section">
+          <div class="timing">
+            <div class="label">Fastest round-trip</div>
+            <div class="val" id="yourStatsMin">—</div>
+            <div class="label">Slowest round-trip</div>
+            <div class="val" id="yourStatsMax">—</div>
+          </div>
+        </div>
+        <div class="diag-meta" id="yourStatsMeta"></div>
+      </div>
+
       <!-- Your attempts (per-device, localStorage) -->
       <div class="card">
         <h2>Your attempts</h2>
@@ -491,6 +521,19 @@
     const HISTORY_POLL_MS = 5000;
     const GLOBAL_LOG_PAGE = 25;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
+
+    // "Your stats" (per-user aggregate) config. In staging the page can be
+    // opened with ?demo=1, which switches the stats lookup to a fixed demo
+    // wallet the server seeds (echo-logic.js DEMO_STATS_PUBKEY) so a tester
+    // sees populated numbers regardless of which wallet they're signed in as.
+    const DEMO_STATS_PUBKEY =
+      "ut1stagingdemoecho000000000000000000000000000000000000000demo0";
+    const IS_DEMO = (() => {
+      try { return new URLSearchParams(window.location.search).get("demo") === "1"; }
+      catch (_) { return false; }
+    })();
+    // Resolved once: the wallet address we render "Your stats" for.
+    let myStatsAddress = null;
 
     /* Map raw sidecar/server error strings to a short human explanation.
        The raw string is still shown as a muted detail line. */
@@ -646,6 +689,12 @@
     const diagMedian = document.getElementById("diagMedian");
     const diagP95 = document.getElementById("diagP95");
     const diagMeta = document.getElementById("diagMeta");
+    const yourStatsTotal = document.getElementById("yourStatsTotal");
+    const yourStatsSuccess = document.getElementById("yourStatsSuccess");
+    const yourStatsAvg = document.getElementById("yourStatsAvg");
+    const yourStatsMin = document.getElementById("yourStatsMin");
+    const yourStatsMax = document.getElementById("yourStatsMax");
+    const yourStatsMeta = document.getElementById("yourStatsMeta");
 
     appPubkeyText.textContent = shortPk(APP_PUBKEY);
 
@@ -1436,6 +1485,72 @@
       diagMeta.textContent = bits.join(" · ");
     }
 
+    /* ── Your stats (per-user aggregate) ──────────────────────
+       Scoped to the signed-in wallet via /__echo/my-stats. Unlike the
+       global Diagnostics card, these numbers count only this wallet's
+       echoes, and unlike "Your attempts" (localStorage) they reflect the
+       server's durable record across devices. */
+    function renderUserStats(stats, haveAddress) {
+      if (!haveAddress) {
+        yourStatsTotal.textContent = "—";
+        yourStatsSuccess.textContent = "—";
+        yourStatsAvg.textContent = "—";
+        yourStatsMin.textContent = "—";
+        yourStatsMax.textContent = "—";
+        yourStatsMeta.textContent = "Connect your wallet to see your stats.";
+        return;
+      }
+      const total = stats && stats.total != null ? stats.total : 0;
+      const confirmed = stats && stats.confirmed != null ? stats.confirmed : 0;
+      yourStatsTotal.textContent = String(total);
+      yourStatsSuccess.textContent = (stats && stats.successRate != null)
+        ? Math.round(stats.successRate * 100) + "%" : "—";
+      // Latency is only defined once at least one echo has confirmed.
+      const haveLat = confirmed > 0;
+      yourStatsAvg.textContent = (haveLat && stats.avgTotalMs != null) ? fmtMs(stats.avgTotalMs) : "—";
+      yourStatsMin.textContent = (haveLat && stats.minTotalMs != null) ? fmtMs(stats.minTotalMs) : "—";
+      yourStatsMax.textContent = (haveLat && stats.maxTotalMs != null) ? fmtMs(stats.maxTotalMs) : "—";
+      if (total === 0) {
+        yourStatsMeta.textContent = "Send your first echo to see your stats.";
+        return;
+      }
+      const bits = [confirmed + " ok"];
+      if (stats.failed) bits.push(stats.failed + " failed");
+      if (stats.skipped) bits.push(stats.skipped + " skipped");
+      if (stats.inFlight) bits.push(stats.inFlight + " in flight");
+      bits.push("your wallet only");
+      yourStatsMeta.textContent = bits.join(" · ");
+    }
+
+    // Resolve the signed-in wallet address once (demo override → bridge).
+    async function resolveMyStatsAddress() {
+      if (IS_DEMO) return DEMO_STATS_PUBKEY;
+      try {
+        if (typeof window.getNodeAddress === "function") {
+          const a = await window.getNodeAddress();
+          if (a) return a;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    async function pollUserStats() {
+      if (!myStatsAddress) myStatsAddress = await resolveMyStatsAddress();
+      if (!myStatsAddress) { renderUserStats(null, false); return; }
+      try {
+        const params = new URLSearchParams();
+        params.set("address", myStatsAddress);
+        if (IS_DEMO) params.set("demo", "1");
+        const r = await fetch("/__echo/my-stats?" + params.toString(), {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        renderUserStats(data, true);
+      } catch (_) { /* ignore — next tick retries */ }
+    }
+
     async function fetchHistoryPage(before) {
       const params = new URLSearchParams();
       params.set("limit", String(GLOBAL_LOG_PAGE));
@@ -1757,6 +1872,11 @@
       // of the newest page (loaded older pages stay put).
       refreshGlobalFirstPage();
       setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
+
+      // Your stats: initial fetch + slow auto-refresh on the same cadence.
+      renderUserStats(null, false);
+      pollUserStats();
+      setInterval(pollUserStats, HISTORY_POLL_MS);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).
