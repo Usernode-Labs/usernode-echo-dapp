@@ -109,8 +109,31 @@
       background: var(--accent); color: #fff;
       border: 0; border-radius: 8px;
       cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      transition: filter 0.15s ease;
+    }
+    button.primary:hover:not(:disabled) { filter: brightness(0.92); }
+    button.primary:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
     }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* In-flight loading state: a small spinning ring sits inline before the
+       label, which switches to "Sending…" (driven by setSending in JS). */
+    .btn-spinner {
+      display: none;
+      width: 14px; height: 14px; flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: btnSpin 0.7s linear infinite;
+    }
+    button.primary.is-sending .btn-spinner { display: inline-block; }
+    @keyframes btnSpin {
+      to { transform: rotate(360deg); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .btn-spinner { animation: none; }
+    }
     .hint {
       font-size: 12px; color: var(--muted); margin-top: 8px;
     }
@@ -264,7 +287,7 @@
         <label for="amountInput">Amount (≥ 2)</label>
         <div class="row">
           <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
-          <button id="sendBtn" class="primary">Send</button>
+          <button id="sendBtn" class="primary" aria-busy="false"><span class="btn-spinner" aria-hidden="true"></span><span id="sendBtnLabel">Send</span></button>
         </div>
         <div class="tx-progress hide" id="txProgress">
           <div class="tx-progress-track"><div class="tx-progress-fill"></div></div>
@@ -485,6 +508,7 @@
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
+    const sendBtnLabel = document.getElementById("sendBtnLabel");
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
@@ -774,6 +798,12 @@
       sending = !!v;
       amountInput.disabled = !!v;
       sendBtn.disabled = !!v;
+      // Drive the button's own presentation from the single source of truth so
+      // it inherits the call-site / generation guarding for free: busy spinner
+      // + "Sending…" label while in flight, back to "Send" on resolve.
+      sendBtn.classList.toggle("is-sending", !!v);
+      sendBtn.setAttribute("aria-busy", v ? "true" : "false");
+      if (sendBtnLabel) sendBtnLabel.textContent = v ? "Sending…" : "Send";
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
         // echo is still pending. The previous entry's eventual confirmation
