@@ -120,6 +120,22 @@
       cursor: pointer;
     }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* Amount field + inline "Max" control. The wrapper is the flex child
+       (so Send still sits beside it via .row); the input fills the wrapper
+       and reserves right padding so typed digits never slide under Max. */
+    .amount-wrap { position: relative; flex: 1 1 auto; display: flex; }
+    .amount-wrap input[type="number"] { padding-right: 66px; }
+    .max-btn {
+      position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+      min-width: 46px; min-height: 32px; padding: 4px 10px;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--border); border-radius: 6px;
+      cursor: pointer; line-height: 1;
+    }
+    .max-btn:hover { border-color: var(--accent); }
+    .max-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .max-btn.loading { color: var(--muted); }
     .hint {
       font-size: 12px; color: var(--muted); margin-top: 8px;
     }
@@ -319,9 +335,13 @@
         <h2>Send</h2>
         <label for="amountInput">Amount (≥ 2)</label>
         <div class="row">
-          <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
+          <div class="amount-wrap">
+            <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
+            <button id="maxBtn" type="button" class="max-btn" aria-label="Use full available balance">Max</button>
+          </div>
           <button id="sendBtn" class="primary">Send</button>
         </div>
+        <div class="hint" id="maxHint" style="display:none"></div>
         <div class="tx-progress hide" id="txProgress">
           <div class="tx-progress-track"><div class="tx-progress-fill"></div></div>
           <div class="tx-progress-label">Sending...</div>
@@ -487,6 +507,10 @@
     // when no upstream is configured (e.g. an offline dev shell with the
     // env var blanked) — UI suppresses the block links in that case.
     const EXPLORER_PUBLIC_BASE = "__EXPLORER_PUBLIC_BASE__";
+    // Server-substituted: "true" inside a staging container, "false" in
+    // production. Gates the ?demo=1 Max-balance override below so production
+    // can never fake a balance.
+    const ECHO_IS_STAGING = ("__ECHO_IS_STAGING__" === "true");
     // Bump STORAGE_VERSION whenever the persisted history shape changes
     // (or any other echo:* key's shape changes). loadHistory() purges
     // older versions on startup so stale entries from previous deploys —
@@ -628,6 +652,8 @@
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
+    const maxBtn = document.getElementById("maxBtn");
+    const maxHint = document.getElementById("maxHint");
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
@@ -950,6 +976,7 @@
       sending = !!v;
       amountInput.disabled = !!v;
       sendBtn.disabled = !!v;
+      if (maxBtn) maxBtn.disabled = !!v;
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
         // echo is still pending. The previous entry's eventual confirmation
@@ -970,6 +997,129 @@
       errMsg.classList.add("err");
     }
     function clearError() { errMsg.style.display = "none"; }
+
+    /* ── Available balance (powers the Max button) ─────────── */
+    // There is no balance API on this stack — the bridge exposes only
+    // getNodeAddress / sendTransaction / signMessage / getTransactions. So we
+    // derive the user's available balance by summing their transaction
+    // history: credits TO their address minus debits FROM it. Paged and
+    // bounded so a long history can't hang the UI. Field normalization
+    // mirrors echo-logic.js (from_pubkey|from|source, destination_pubkey|to|
+    // destination, amount).
+    const BALANCE_PAGE_LIMIT = 50;
+    const BALANCE_MAX_PAGES = 20;   // ≤1000 tx scanned; caps cost on huge histories
+    let availableBalance = null;    // whole tokens, or null = unknown/unloaded/failed
+    let balanceAddr = null;         // resolved wallet address, or null if none
+    let balancePromise = null;      // in-flight refresh (shared by concurrent Max clicks)
+    let balanceResolvedOnce = false;
+    let balanceDemo = false;        // staging/mock ?demo=1 override (no-op in prod)
+
+    function txTo(tx) { return tx.destination_pubkey || tx.to || tx.destination || null; }
+    function txFrom(tx) { return tx.from_pubkey || tx.from || tx.source || null; }
+
+    async function resolveWalletAddress() {
+      try {
+        if (typeof window.getNodeAddress === "function") {
+          const a = await window.getNodeAddress();
+          const s = a && String(a).trim();
+          return s || null;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    async function deriveBalanceFromHistory(addr) {
+      let balance = 0, cursor = null, pages = 0;
+      while (pages < BALANCE_MAX_PAGES) {
+        const filter = { account: addr, limit: BALANCE_PAGE_LIMIT };
+        if (cursor) filter.cursor = cursor;
+        const resp = await window.getTransactions(filter);
+        const items = (resp && (resp.items || resp.transactions || resp.txs)) || [];
+        for (const tx of items) {
+          const amt = Number(tx.amount);
+          if (!Number.isFinite(amt)) continue;
+          if (txTo(tx) === addr) balance += amt;
+          else if (txFrom(tx) === addr) balance -= amt;
+        }
+        pages++;
+        const hasMore = !!(resp && (resp.has_more || resp.hasMore));
+        cursor = resp && (resp.next_cursor || resp.nextCursor);
+        if (!hasMore || !cursor) break;
+      }
+      if (pages >= BALANCE_MAX_PAGES) {
+        console.warn("[echo] balance: hit " + BALANCE_MAX_PAGES +
+          "-page cap; value is a lower-bound over recent transactions");
+      }
+      return Math.max(0, Math.floor(balance));
+    }
+
+    // Recompute availableBalance. Returns the in-flight promise so a Max
+    // click that lands before the first load completes can await the same
+    // fetch instead of starting a second one.
+    function refreshAvailableBalance(force) {
+      if (balancePromise && !force) return balancePromise;
+      const p = (async () => {
+        if (balanceDemo) { balanceAddr = "demo"; availableBalance = 137; return availableBalance; }
+        const addr = await resolveWalletAddress();
+        balanceAddr = addr;
+        if (!addr) { availableBalance = null; return null; }
+        try {
+          availableBalance = await deriveBalanceFromHistory(addr);
+        } catch (e) {
+          console.warn("[echo] balance fetch failed: " + (e && e.message ? e.message : e));
+          availableBalance = null;
+        }
+        return availableBalance;
+      })();
+      balancePromise = p;
+      p.then(() => {}, () => {}).then(() => {
+        balanceResolvedOnce = true;
+        if (balancePromise === p) balancePromise = null;
+        updateMaxVisibility();
+      });
+      return p;
+    }
+
+    function updateMaxVisibility() {
+      if (!maxBtn) return;
+      // Hide entirely once we know there's no resolvable wallet address
+      // (e.g. desktop QR fallback with no linked pubkey) — never leave a
+      // non-functional control on screen.
+      const noWallet = balanceResolvedOnce && !balanceDemo && balanceAddr == null;
+      maxBtn.style.display = noWallet ? "none" : "";
+    }
+
+    function setMaxLoading(on) {
+      if (!maxBtn) return;
+      maxBtn.classList.toggle("loading", !!on);
+      maxBtn.textContent = on ? "…" : "Max";
+    }
+
+    function showMaxHint(msg) {
+      if (!maxHint) return;
+      maxHint.textContent = msg || "";
+      maxHint.style.display = msg ? "block" : "none";
+    }
+
+    async function onMaxClick() {
+      if (sending) return;
+      showMaxHint("");
+      let bal = availableBalance;
+      if (bal == null) {
+        // Not loaded yet (or a prior fetch failed) — fetch now with a spinner.
+        setMaxLoading(true);
+        maxBtn.disabled = true;
+        try { bal = await refreshAvailableBalance(true); }
+        finally { setMaxLoading(false); maxBtn.disabled = sending; }
+      }
+      if (balanceAddr == null && !balanceDemo) return; // no wallet — button is hidden
+      if (bal == null) { showMaxHint("Couldn't load your balance — tap Max to retry."); return; }
+      if (bal < 2) { showMaxHint("Balance too low to echo (need ≥ 2)."); return; }
+      amountInput.value = String(bal);
+      clearError();
+      // Let any listeners (and native number-input UI) react to the change.
+      amountInput.dispatchEvent(new Event("input", { bubbles: true }));
+    }
 
     /* ── Send flow ────────────────────────────────────────── */
     sendBtn.addEventListener("click", async () => {
@@ -1140,6 +1290,10 @@
       // counter until pollServerState() sees the echo land.
       if (entry.status === "echoing") startEchoPhaseProgressBar(entry.requestTxId);
       else hideProgressBarNow();
+
+      // The send changed the user's balance — refresh so a subsequent Max
+      // reflects it. Best-effort; the new value lands when it lands.
+      refreshAvailableBalance(true);
     });
 
     /* ── Render ───────────────────────────────────────────── */
@@ -1884,6 +2038,19 @@
           }
         } catch (_) {}
       }
+
+      // Max button: derive the user's available balance (client-side, via
+      // getTransactions — there is no balance API). In a staging container or
+      // local-dev mock mode, a ?demo=1 query injects a fixed demo balance so
+      // Max is demonstrable without a funded wallet. Strict no-op in
+      // production: ECHO_IS_STAGING is false and live mode is not mock, so the
+      // override never fires and the real on-chain derivation runs instead.
+      try {
+        const demoParam = new URLSearchParams(window.location.search).get("demo") === "1";
+        balanceDemo = demoParam && (ECHO_IS_STAGING || isMock);
+      } catch (_) { balanceDemo = false; }
+      if (maxBtn) maxBtn.addEventListener("click", onMaxClick);
+      refreshAvailableBalance(true);
 
       setInterval(pollServerState, STATE_POLL_MS);
       pollServerState();
