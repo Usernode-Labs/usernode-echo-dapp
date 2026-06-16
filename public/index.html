@@ -395,13 +395,15 @@
       padding: 0 6px 8px; text-transform: uppercase; letter-spacing: 0.4px;
     }
     .leaderboard-table th.lb-amount,
-    .leaderboard-table th.lb-count { text-align: right; }
+    .leaderboard-table th.lb-count,
+    .leaderboard-table th.lb-latency { text-align: right; }
     .leaderboard-table tbody tr { border-top: 1px solid var(--border); }
     .leaderboard-table td { padding: 8px 6px; }
     .lb-rank { color: var(--muted); width: 24px; font-variant-numeric: tabular-nums; }
     .lb-user { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .lb-amount { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .lb-count { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .leaderboard-table .lb-latency { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
@@ -409,7 +411,7 @@
     /* Leaderboard card */
     .lb-row {
       display: grid;
-      grid-template-columns: 28px 1fr auto auto;
+      grid-template-columns: 28px 1fr auto auto auto;
       align-items: center;
       gap: 8px;
       padding: 7px 4px;
@@ -431,6 +433,7 @@
     .lb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
@@ -688,10 +691,11 @@
               <th>User</th>
               <th class="lb-amount">Total sent</th>
               <th class="lb-count">Echoes</th>
+              <th class="lb-latency">Avg latency</th>
             </tr>
           </thead>
           <tbody id="leaderboardBody">
-            <tr><td colspan="4" class="history-empty">Loading…</td></tr>
+            <tr><td colspan="5" class="history-empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -2235,15 +2239,19 @@
     }
 
     /* ── Leaderboard ──────────────────────────────────────── */
+    function fmtLatency(ms) {
+      if (ms == null || !Number.isFinite(ms)) return "—";
+      return (ms / 1000).toFixed(1) + "s";
+    }
+
     function renderLeaderboard() {
       const tbody = document.getElementById("leaderboardBody");
       if (!tbody) return;
       tbody.innerHTML = "";
       if (leaderboard === null) {
-        // Still loading — keep the placeholder row set in HTML.
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "Loading…";
         tr.appendChild(td);
@@ -2253,7 +2261,7 @@
       if (leaderboard === false) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "Couldn't load leaderboard.";
         tr.appendChild(td);
@@ -2263,7 +2271,7 @@
       if (leaderboard.length === 0) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "No confirmed echoes yet.";
         tr.appendChild(td);
@@ -2272,14 +2280,15 @@
       }
       leaderboard.forEach(function (entry, i) {
         const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
-          ? window.UsernameUsernames.getUsernameSync(entry.sender)
-          : entry.sender.slice(-6);
+          ? window.UsernameUsernames.getUsernameSync(entry.address)
+          : entry.address.slice(-6);
         const tr = document.createElement("tr");
         const cells = [
-          { cls: "lb-rank",   text: String(i + 1) },
-          { cls: "lb-user",   text: displayName },
-          { cls: "lb-amount", text: Number(entry.totalSent).toLocaleString() },
-          { cls: "lb-count",  text: String(entry.echoCount) },
+          { cls: "lb-rank",    text: String(i + 1) },
+          { cls: "lb-user",    text: displayName },
+          { cls: "lb-amount",  text: Number(entry.tokensSent).toLocaleString() },
+          { cls: "lb-count",   text: String(entry.echoCount) },
+          { cls: "lb-latency", text: fmtLatency(entry.avgLatencyMs) },
         ];
         cells.forEach(function (c) {
           const td = document.createElement("td");
@@ -2431,10 +2440,15 @@
         echoesEl.className = "lb-echoes";
         echoesEl.textContent = entry.echoCount + "×";
 
+        const latencyEl = document.createElement("div");
+        latencyEl.className = "lb-latency";
+        latencyEl.textContent = fmtLatency(entry.avgLatencyMs);
+
         row.appendChild(rankEl);
         row.appendChild(nameEl);
         row.appendChild(tokensEl);
         row.appendChild(echoesEl);
+        row.appendChild(latencyEl);
         el.appendChild(row);
       });
     }

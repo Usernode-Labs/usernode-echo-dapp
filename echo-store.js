@@ -395,28 +395,31 @@ function createEchoStore(opts = {}) {
   // container. Idempotent via ON CONFLICT DO NOTHING.
   async function seedStagingLeaderboard(chainId) {
     if (!isReady()) return;
+    // Each row: [txId, sender, amt, echoAmt, requestTs, echoConfirmedTs]
+    // Latencies: alpha≈3200ms, beta≈5800ms, gamma≈2100ms, delta≈9400ms, epsilon≈1500ms
+    const base = 1700000000000;
     const seeds = [
-      ["seed-lb-alpha-1", "staging-demo-alpha",   150, 149],
-      ["seed-lb-alpha-2", "staging-demo-alpha",   200, 199],
-      ["seed-lb-alpha-3", "staging-demo-alpha",   100,  99],
-      ["seed-lb-beta-1",  "staging-demo-beta",     50,  49],
-      ["seed-lb-beta-2",  "staging-demo-beta",    250, 249],
-      ["seed-lb-gamma-1", "staging-demo-gamma",    50,  49],
-      ["seed-lb-gamma-2", "staging-demo-gamma",    50,  49],
-      ["seed-lb-gamma-3", "staging-demo-gamma",    25,  24],
-      ["seed-lb-gamma-4", "staging-demo-gamma",    25,  24],
-      ["seed-lb-delta-1", "staging-demo-delta",    80,  79],
-      ["seed-lb-eps-1",   "staging-demo-epsilon",  10,   9],
-      ["seed-lb-eps-2",   "staging-demo-epsilon",  10,   9],
+      ["seed-lb-alpha-1", "staging-demo-alpha",   150, 149, base +  0,      base +  0 +  3200],
+      ["seed-lb-alpha-2", "staging-demo-alpha",   200, 199, base +  10000,  base +  10000 +  3200],
+      ["seed-lb-alpha-3", "staging-demo-alpha",   100,  99, base +  20000,  base +  20000 +  3200],
+      ["seed-lb-beta-1",  "staging-demo-beta",     50,  49, base +  30000,  base +  30000 +  5800],
+      ["seed-lb-beta-2",  "staging-demo-beta",    250, 249, base +  40000,  base +  40000 +  5800],
+      ["seed-lb-gamma-1", "staging-demo-gamma",    50,  49, base +  50000,  base +  50000 +  2100],
+      ["seed-lb-gamma-2", "staging-demo-gamma",    50,  49, base +  60000,  base +  60000 +  2100],
+      ["seed-lb-gamma-3", "staging-demo-gamma",    25,  24, base +  70000,  base +  70000 +  2100],
+      ["seed-lb-gamma-4", "staging-demo-gamma",    25,  24, base +  80000,  base +  80000 +  2100],
+      ["seed-lb-delta-1", "staging-demo-delta",    80,  79, base +  90000,  base +  90000 +  9400],
+      ["seed-lb-eps-1",   "staging-demo-epsilon",  10,   9, base + 100000,  base + 100000 +  1500],
+      ["seed-lb-eps-2",   "staging-demo-epsilon",  10,   9, base + 110000,  base + 110000 +  1500],
     ];
-    for (const [txId, sender, amt, echoAmt] of seeds) {
+    for (const [txId, sender, amt, echoAmt, reqTs, echoTs] of seeds) {
       await pool.query(
         `INSERT INTO echo_events
            (request_tx_id, chain_id, request_from, request_amount,
-            echo_amount, status, retry_attempts)
-         VALUES ($1, $2, $3, $4, $5, 'confirmed', 0)
+            echo_amount, status, retry_attempts, request_ts, echo_confirmed_ts)
+         VALUES ($1, $2, $3, $4, $5, 'confirmed', 0, $6, $7)
          ON CONFLICT (request_tx_id) DO NOTHING`,
-        [txId, chainId || null, sender, amt, echoAmt]
+        [txId, chainId || null, sender, amt, echoAmt, reqTs, echoTs]
       );
     }
     console.log("[echo-store] staging leaderboard seed applied");
