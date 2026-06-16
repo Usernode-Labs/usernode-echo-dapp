@@ -438,6 +438,9 @@
     }
     .footer-note .pubkey { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+    /* Latency trend chart */
+    #trendChart svg { display: block; overflow: visible; }
+
     /* Toast notifications */
     @keyframes toast-in {
       from { transform: translateX(110%); opacity: 0; }
@@ -551,6 +554,15 @@
           </div>
         </div>
         <div class="diag-meta" id="diagMeta"></div>
+      </div>
+
+      <!-- Latency trend chart (signal = per-minute median, noise = IQR band) -->
+      <div class="card" id="trendCard" style="display:none">
+        <h2>Latency trend <span class="modePill" id="trendPill" style="display:none"></span></h2>
+        <div id="trendChart"></div>
+        <div class="section-sub" id="trendEmpty" style="display:none">
+          Not enough data yet — send a few echoes to populate this chart.
+        </div>
       </div>
 
       <!-- Success Rate Over Time chart -->
@@ -1176,6 +1188,10 @@
     const diagMedian = document.getElementById("diagMedian");
     const diagP95 = document.getElementById("diagP95");
     const diagMeta = document.getElementById("diagMeta");
+    const trendCard = document.getElementById("trendCard");
+    const trendChart = document.getElementById("trendChart");
+    const trendEmpty = document.getElementById("trendEmpty");
+    const trendPill = document.getElementById("trendPill");
     const yourStatsTotal = document.getElementById("yourStatsTotal");
     const yourStatsSuccess = document.getElementById("yourStatsSuccess");
     const yourStatsAvg = document.getElementById("yourStatsAvg");
@@ -1202,6 +1218,10 @@
     let globalLog = [];            // array of server event rows
     let globalCursor = null;       // nextCursor for pagination
     let globalLoading = false;
+
+    // Tracks whether the health banner is showing a latency anomaly so the
+    // trend chart can tint its signal line accordingly.
+    let latencyAnomaly = false;
 
     // Leaderboard state: null = loading, false = fetch error, array = data.
     let leaderboard = null;
@@ -2705,11 +2725,17 @@
 
     // Auto-refresh: re-fetch the newest page for liveness + stats, but keep
     // any older pages the user pulled in via "Load more" (those are static).
+    // Also fetches /__echo/metrics in parallel to update the latency trend chart.
     async function refreshGlobalFirstPage() {
       if (globalLoading) return;
       globalLoading = true;
       try {
-        const data = await fetchHistoryPage(null);
+        const [data, metricsResp] = await Promise.all([
+          fetchHistoryPage(null),
+          fetch("/__echo/metrics", { cache: "no-store", headers: authHeaders() })
+            .then((r) => r.ok ? r.json() : null)
+            .catch(() => null),
+        ]);
         const fresh = Array.isArray(data.events) ? data.events : [];
         const wasEmpty = globalLog.length === 0;
         const freshIds = new Set(fresh.map((e) => e.requestTxId));
@@ -2721,6 +2747,10 @@
         renderGlobalLog();
         renderDiagnostics(data.stats);
         if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+
+        if (metricsResp && metricsResp.series) {
+          renderTrendChart(metricsResp.series.chain_rtt_ms, latencyAnomaly);
+        }
       } catch (_) {
         /* transient — next poll retries */
       } finally {
@@ -2791,6 +2821,7 @@
        No detail beyond the category — just enough to reassure the user
        that a slow/missing echo is the service, not their phone. */
     function updateHealthBanner(health) {
+      latencyAnomaly = !!(health && health.degraded && health.worst === "latency");
       if (!health || !health.degraded) {
         healthBanner.classList.add("hide");
         return;
@@ -2811,6 +2842,119 @@
       healthBanner.textContent = msg;
       healthBanner.classList.toggle("critical", critical);
       healthBanner.classList.remove("hide");
+    }
+
+    /* ── Latency trend chart ──────────────────────────────────
+       Renders a pure-SVG signal+noise chart from /__echo/metrics data.
+       series: array of {t, v, p25?, p75?, n} per-minute buckets (chain_rtt_ms).
+       anomalyActive: when true, tints the signal line amber. */
+    function renderTrendChart(series, anomalyActive) {
+      const pts = (series || []).slice(-120).filter((p) => p != null && p.v != null);
+
+      // Sync mode pill with the top-bar pill
+      if (modePill.textContent && modePill.textContent !== "…") {
+        trendPill.textContent = modePill.textContent;
+        trendPill.style.display = "";
+      }
+
+      trendCard.style.display = "block";
+
+      if (pts.length < 3) {
+        trendChart.innerHTML = "";
+        trendEmpty.style.display = "block";
+        return;
+      }
+      trendEmpty.style.display = "none";
+
+      // Layout constants
+      const W = 400, H = 180;
+      const padL = 44, padR = 8, padT = 10, padB = 22;
+      const cW = W - padL - padR;
+      const cH = H - padT - padB;
+
+      // X range
+      const tMin = pts[0].t;
+      const tMax = pts[pts.length - 1].t;
+      const tRange = Math.max(tMax - tMin, 60000);
+
+      // Y range — include p25/p75 in the extent calculation
+      const allVals = pts.flatMap((p) => [
+        p.v,
+        p.p25 != null ? p.p25 : p.v,
+        p.p75 != null ? p.p75 : p.v,
+      ]);
+      const rawMin = Math.min.apply(null, allVals);
+      const rawMax = Math.max.apply(null, allVals);
+      const vMin = Math.max(0, rawMin * 0.85);
+      const vMax = rawMax * 1.10;
+      const vRange = Math.max(vMax - vMin, 100);
+
+      function xOf(t)  { return padL + (t - tMin) / tRange * cW; }
+      function yOf(v)  { return padT + cH - (v - vMin) / vRange * cH; }
+
+      function fmtTime(ms) {
+        const d = new Date(ms);
+        return d.getHours().toString().padStart(2, "0") + ":" +
+               d.getMinutes().toString().padStart(2, "0");
+      }
+      function fmtYTick(v) {
+        if (v < 1000) return Math.round(v) + "ms";
+        return (v / 1000).toFixed(1) + "s";
+      }
+
+      // Band polygon: upper (p75) L→R, lower (p25) R→L
+      const upper = pts.map((p) => xOf(p.t).toFixed(1) + "," + yOf(p.p75 != null ? p.p75 : p.v).toFixed(1));
+      const lower = pts.map((p) => xOf(p.t).toFixed(1) + "," + yOf(p.p25 != null ? p.p25 : p.v).toFixed(1));
+      const bandPts = upper.concat(lower.slice().reverse()).join(" ");
+
+      // Signal polyline
+      const sigPts = pts.map((p) => xOf(p.t).toFixed(1) + "," + yOf(p.v).toFixed(1)).join(" ");
+
+      // Colors
+      const sigStroke  = anomalyActive ? "var(--warn)" : "var(--accent)";
+      const bandFill   = anomalyActive ? "rgba(202,138,4,0.14)" : "rgba(37,99,235,0.10)";
+      const dotFill    = anomalyActive ? "var(--warn)" : "var(--accent)";
+
+      // Y-axis ticks
+      const yTicks = [vMin, vMin + vRange / 2, vMin + vRange];
+
+      // X-axis ticks (3–4 evenly spread)
+      const numX = Math.min(4, pts.length);
+      const xIdxs = numX === 1
+        ? [0]
+        : Array.from({ length: numX }, (_, i) => Math.round(i * (pts.length - 1) / (numX - 1)));
+
+      let out = `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg">`;
+
+      // IQR band
+      out += `<polygon points="${bandPts}" fill="${bandFill}" />`;
+
+      // Signal line
+      out += `<polyline points="${sigPts}" fill="none" stroke="${sigStroke}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />`;
+
+      // Point circles with native tooltips
+      for (const p of pts) {
+        const cx = xOf(p.t).toFixed(1);
+        const cy = yOf(p.v).toFixed(1);
+        const spread = (p.p25 != null && p.p75 != null)
+          ? " · spread: ±" + fmtYTick((p.p75 - p.p25) / 2) : "";
+        const tip = fmtTime(p.t) + " · p50: " + fmtYTick(p.v) + spread;
+        out += `<circle cx="${cx}" cy="${cy}" r="3" fill="${dotFill}" fill-opacity="0.75"><title>${tip}</title></circle>`;
+      }
+
+      // Y-axis labels
+      for (const v of yTicks) {
+        out += `<text x="${padL - 4}" y="${yOf(v).toFixed(1)}" text-anchor="end" dy="0.35em" font-size="9" font-family="inherit" fill="var(--muted)">${fmtYTick(v)}</text>`;
+      }
+
+      // X-axis labels
+      for (const idx of xIdxs) {
+        const p = pts[idx];
+        out += `<text x="${xOf(p.t).toFixed(1)}" y="${H - 4}" text-anchor="middle" font-size="9" font-family="inherit" fill="var(--muted)">${fmtTime(p.t)}</text>`;
+      }
+
+      out += "</svg>";
+      trendChart.innerHTML = out;
     }
 
     async function pollHealth() {
