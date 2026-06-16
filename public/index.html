@@ -2387,6 +2387,21 @@
       return (ms / 1000).toFixed(1) + "s";
     }
 
+    // Display name for a leaderboard row. Priority:
+    //   1. entry.username — the player's Usernode username, captured from
+    //      req.user when their scores were recorded (server-side, authoritative).
+    //   2. on-chain username registered for the address (UsernodeUsernames).
+    //   3. raw id fallback ("…<last 8>" of the pubkey) when nothing is known.
+    function leaderboardName(entry) {
+      if (entry && entry.username) return entry.username;
+      const addr = entry && entry.address ? entry.address : "";
+      const onchain = (window.UsernodeUsernames && window.UsernodeUsernames.getUsernameSync)
+        ? window.UsernodeUsernames.getUsernameSync(addr)
+        : null;
+      if (onchain) return onchain;
+      return addr ? ("…" + addr.slice(-8)) : "—";
+    }
+
     function renderLeaderboard() {
       const tbody = document.getElementById("leaderboardBody");
       if (!tbody) return;
@@ -2422,9 +2437,7 @@
         return;
       }
       leaderboard.forEach(function (entry, i) {
-        const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
-          ? window.UsernameUsernames.getUsernameSync(entry.address)
-          : entry.address.slice(-6);
+        const displayName = leaderboardName(entry);
         const tr = document.createElement("tr");
         const cells = [
           { cls: "lb-rank",    text: String(i + 1) },
@@ -2669,9 +2682,7 @@
       entries.forEach((entry, idx) => {
         const rank = idx + 1;
         const isSelf = myStatsAddress && entry.address === myStatsAddress;
-        const name = (UsernodeUsernames && UsernodeUsernames.getUsernameSync)
-          ? (UsernodeUsernames.getUsernameSync(entry.address) || ("…" + entry.address.slice(-8)))
-          : ("…" + entry.address.slice(-8));
+        const name = leaderboardName(entry);
         const row = document.createElement("div");
         row.className = "lb-row" + (isSelf ? " lb-row-self" : "");
 

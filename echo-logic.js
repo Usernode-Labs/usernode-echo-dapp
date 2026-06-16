@@ -1201,6 +1201,7 @@ function createEcho(opts) {
         tokensSent: a.tokensSent,
         echoCount: a.echoCount,
         avgLatencyMs: a.latCount > 0 ? a.latSum / a.latCount : null,
+        username: typeof store.lookupIdentity === "function" ? store.lookupIdentity(address) : null,
       }))
       .sort((a, b) => b.tokensSent - a.tokensSent)
       .slice(0, lim);
@@ -1237,7 +1238,20 @@ function createEcho(opts) {
     sendJson(req, res, { entries, chainId: cid, count: entries.length, mode });
   }
 
+  // Capture the viewer's Usernode username (set by the JWT-verifying
+  // middleware in server.js) keyed by their on-chain pubkey, so the
+  // leaderboard can show real usernames instead of "user_…" id fallbacks.
+  // Echo stays public — this never gates a request, it only records.
+  function captureIdentity(req) {
+    const u = req && req.user;
+    if (!u || typeof store.recordIdentity !== "function") return;
+    const addr = u.usernode_pubkey || u.usernodePubkey || null;
+    const name = u.username || null;
+    if (addr && name) store.recordIdentity(addr, name);
+  }
+
   function handleRequest(req, res, pathname) {
+    if (pathname.startsWith("/__echo/")) captureIdentity(req);
     if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
       handleLeaderboard(req, res).catch((e) => {

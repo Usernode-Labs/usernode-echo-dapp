@@ -89,6 +89,59 @@ app.set("trust proxy", 1);
 // Health check — used by Docker healthcheck and platform polling.
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
+// ── Identity capture (non-gating) ─────────────────────────────────────────────
+// Echo is public and stays public — there is NO auth gate. But the platform
+// shell injects a signed session JWT (?token=… on load, x-usernode-token on
+// subsequent fetches). When present and valid we decode `req.user` so echo can
+// record the sender's real Usernode username for the leaderboard. A missing or
+// invalid token simply leaves `req.user` undefined; the request proceeds.
+// HS256 is verified with the built-in crypto module so we don't reintroduce a
+// `jsonwebtoken` dependency (see CLAUDE.md "Auth model").
+const JWT_SECRET = process.env.JWT_SECRET || "";
+
+function b64urlToBuf(s) {
+  return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
+function verifyHs256Jwt(token, secret) {
+  if (!token || !secret) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header;
+  try {
+    header = JSON.parse(b64urlToBuf(headerB64).toString("utf8"));
+  } catch (_) {
+    return null;
+  }
+  if (!header || header.alg !== "HS256") return null;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest();
+  const given = b64urlToBuf(sigB64);
+  if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) {
+    return null;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(b64urlToBuf(payloadB64).toString("utf8"));
+  } catch (_) {
+    return null;
+  }
+  if (payload && payload.exp && Date.now() / 1000 > payload.exp) return null;
+  return payload;
+}
+
+app.use((req, _res, next) => {
+  const token = req.query.token || req.headers["x-usernode-token"];
+  if (token && JWT_SECRET) {
+    const payload = verifyHs256Jwt(String(token), JWT_SECRET);
+    if (payload) req.user = payload;
+  }
+  next();
+});
+
 // ── Mock API (only --local-dev) ──────────────────────────────────────────────
 const mockApi = createMockApi({ localDev: LOCAL_DEV });
 app.use((req, res, next) => {
