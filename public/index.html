@@ -119,6 +119,7 @@
       background: var(--accent); color: #fff;
       border: 0; border-radius: 8px;
       cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
       box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);
       transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
     }
@@ -127,7 +128,27 @@
       box-shadow: 0 6px 18px rgba(124, 58, 237, 0.45);
     }
     button.primary:active:not(:disabled) { transform: translateY(1px); }
+    button.primary:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; }
+    /* In-flight loading state: a small spinning ring sits inline before the
+       label, which switches to "Sending…" (driven by setSending in JS). */
+    .btn-spinner {
+      display: none;
+      width: 14px; height: 14px; flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: btnSpin 0.7s linear infinite;
+    }
+    button.primary.is-sending .btn-spinner { display: inline-block; }
+    @keyframes btnSpin {
+      to { transform: rotate(360deg); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .btn-spinner { animation: none; }
+    }
     /* Amount field + inline "Max" control. The wrapper is the flex child
        (so Send still sits beside it via .row); the input fills the wrapper
        and reserves right padding so typed digits never slide under Max. */
@@ -461,7 +482,7 @@
             <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
             <button id="maxBtn" type="button" class="max-btn" aria-label="Use full available balance">Max</button>
           </div>
-          <button id="sendBtn" class="primary">Send</button>
+          <button id="sendBtn" class="primary" aria-busy="false"><span class="btn-spinner" aria-hidden="true"></span><span id="sendBtnLabel">Send</span></button>
         </div>
         <div class="hint" id="maxHint" style="display:none"></div>
         <div class="tx-progress hide" id="txProgress">
@@ -998,6 +1019,7 @@
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
+    const sendBtnLabel = document.getElementById("sendBtnLabel");
     const maxBtn = document.getElementById("maxBtn");
     const maxHint = document.getElementById("maxHint");
     const errMsg = document.getElementById("errMsg");
@@ -1343,6 +1365,12 @@
       sending = !!v;
       amountInput.disabled = !!v;
       sendBtn.disabled = !!v;
+      // Drive the button's own presentation from the single source of truth so
+      // it inherits the call-site / generation guarding for free: busy spinner
+      // + "Sending…" label while in flight, back to "Send" on resolve.
+      sendBtn.classList.toggle("is-sending", !!v);
+      sendBtn.setAttribute("aria-busy", v ? "true" : "false");
+      if (sendBtnLabel) sendBtnLabel.textContent = v ? "Sending…" : "Send";
       if (maxBtn) maxBtn.disabled = !!v;
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
