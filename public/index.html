@@ -385,7 +385,7 @@
       text-decoration: none; line-height: 1.5;
     }
     .block-chip:hover, .block-chip:focus { text-decoration: underline; }
-    .block-chip .arrow { font-size: 10px; opacity: 0.7; }
+    .block-chip .arrow { width: 10px; height: 10px; opacity: 0.7; vertical-align: middle; margin-left: 2px; flex-shrink: 0; }
     .block-chip-label { font-size: 10px; color: var(--muted); margin-right: 2px; }
 
     /* Leaderboard table */
@@ -914,9 +914,27 @@
       node.appendChild(lbl);
       node.appendChild(text);
       if (useLink) {
-        const arrow = document.createElement("span");
-        arrow.className = "arrow";
-        arrow.textContent = "↗";
+        const arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        arrow.setAttribute("class", "arrow");
+        arrow.setAttribute("viewBox", "0 0 24 24");
+        arrow.setAttribute("fill", "none");
+        arrow.setAttribute("stroke", "currentColor");
+        arrow.setAttribute("stroke-width", "2");
+        arrow.setAttribute("stroke-linecap", "round");
+        arrow.setAttribute("stroke-linejoin", "round");
+        arrow.setAttribute("aria-hidden", "true");
+        // Box (partial — left, bottom, right sides + top-left corner)
+        const boxPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        boxPath.setAttribute("d", "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6");
+        arrow.appendChild(boxPath);
+        // Top-right bracket (corner of arrow origin)
+        const bracketPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        bracketPath.setAttribute("d", "M15 3h6v6");
+        arrow.appendChild(bracketPath);
+        // Diagonal arrow line
+        const linePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        linePath.setAttribute("d", "M10 14L21 3");
+        arrow.appendChild(linePath);
         node.appendChild(arrow);
       }
       return node;
