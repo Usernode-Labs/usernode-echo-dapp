@@ -1,8 +1,19 @@
 FROM node:22-alpine
 WORKDIR /app
+# Build toolchain for better-sqlite3's native addon. Alpine uses musl, so the
+# package's prebuilt (glibc) binaries don't apply and it compiles from source.
+RUN apk add --no-cache --virtual .build-deps python3 make g++
 COPY package.json ./
-RUN npm install --production
+RUN npm install --production && apk del .build-deps
 COPY . .
+
+# Persistent store for historical metrics + anomaly baselines. Declared as a
+# volume so the better-sqlite3 DB survives container restarts; if the volume is
+# absent or unwritable the metrics store degrades to in-memory (persistent:false).
+ENV ECHO_DATA_DIR=/app/data
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
 EXPOSE 3000
 # 127.0.0.1, not localhost: in Alpine `/etc/hosts` lists `::1 localhost`
 # before `127.0.0.1 localhost`, BusyBox wget resolves to the v6 address

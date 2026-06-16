@@ -9,6 +9,8 @@
     "dev": "node server.js --local-dev"
   },
   "dependencies": {
-    "express": "^4.21.0"
+    "better-sqlite3": "^11.8.0",
+    "express": "^4.22.2",
+    "pg": "^8.13.1"
   }
 }
