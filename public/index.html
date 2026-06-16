@@ -675,6 +675,7 @@
         <div class="section-sub">Recent echoes across every viewer — survives restarts.</div>
         <div id="globalLog"></div>
         <button class="load-more" id="loadMoreBtn" style="display:none">Load more</button>
+        <a class="load-more" id="viewFullHistoryBtn" style="display:none;text-align:center;text-decoration:none" target="_blank" rel="noopener noreferrer">View full history ↗</a>
       </div>
 
       <!-- Leaderboard (all-time top senders by total tokens, confirmed echoes only) -->
@@ -780,6 +781,7 @@
     // Leaderboard refresh cadence — rank changes infrequently.
     const LEADERBOARD_POLL_MS = 60000;
     const GLOBAL_LOG_PAGE = 25;
+    const GLOBAL_LOG_CAP = 50;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
 
     // "Your stats" (per-user aggregate) config. In staging the page can be
@@ -1171,6 +1173,10 @@
     exportCsvBtn.addEventListener("click", exportCsv);
     const globalLogEl = document.getElementById("globalLog");
     const loadMoreBtn = document.getElementById("loadMoreBtn");
+    const viewFullHistoryBtn = document.getElementById("viewFullHistoryBtn");
+    if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) {
+      viewFullHistoryBtn.href = EXPLORER_PUBLIC_BASE + "/address/" + APP_PUBKEY;
+    }
     const diagCard = document.getElementById("diagCard");
     const diagSuccess = document.getElementById("diagSuccess");
     const diagMedian = document.getElementById("diagMedian");
@@ -2720,7 +2726,12 @@
         if (wasEmpty) globalCursor = data.nextCursor || null;
         renderGlobalLog();
         renderDiagnostics(data.stats);
-        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        if (globalLog.length >= GLOBAL_LOG_CAP) {
+          if (loadMoreBtn) loadMoreBtn.style.display = "none";
+          if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) viewFullHistoryBtn.style.display = "block";
+        } else {
+          if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        }
       } catch (_) {
         /* transient — next poll retries */
       } finally {
@@ -2740,10 +2751,17 @@
           const seen = new Set(globalLog.map((e) => e.requestTxId));
           for (const ev of data.events) if (!seen.has(ev.requestTxId)) globalLog.push(ev);
         }
+        if (globalLog.length > GLOBAL_LOG_CAP) globalLog.length = GLOBAL_LOG_CAP;
         globalCursor = data.nextCursor || null;
         renderGlobalLog();
         renderDiagnostics(data.stats);
-        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        if (globalLog.length >= GLOBAL_LOG_CAP) {
+          globalCursor = null;
+          if (loadMoreBtn) loadMoreBtn.style.display = "none";
+          if (viewFullHistoryBtn && EXPLORER_PUBLIC_BASE) viewFullHistoryBtn.style.display = "block";
+        } else {
+          if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+        }
       } catch (_) {
         /* ignore — user can retry */
       } finally {
