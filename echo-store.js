@@ -336,20 +336,115 @@ function createEchoStore(opts = {}) {
     if (n > 0) console.log(`[echo-store] pruned ${n} old rows (${aged.rowCount || 0} aged, ${capped.rowCount || 0} over cap)`);
   }
 
-  async function close() {
-    if (pruneTimer) clearInterval(pruneTimer);
-    if (pool) {
-      try { await pool.end(); } catch (_) {}
+  // Hourly success-rate buckets for the chart. Returns an array of bucket
+  // objects sorted oldest-to-newest, or null when the store is not ready.
+  // Uses IS NOT DISTINCT FROM for null-safe chain_id comparison.
+  async function getSuccessRateBuckets(chainId, windowHours = 24) {
+    if (!isReady()) return null;
+    const hours = Math.max(1, Math.min(168, windowHours || 24));
+    const sql = `
+      SELECT
+        date_trunc('hour', created_at) AS hour_start,
+        COUNT(*) FILTER (WHERE status = 'confirmed')::int AS confirmed,
+        COUNT(*) FILTER (WHERE status = 'failed')::int    AS failed,
+        COUNT(*) FILTER (WHERE status = 'skipped')::int   AS skipped
+      FROM echo_events
+      WHERE chain_id IS NOT DISTINCT FROM $1
+        AND status IN ('confirmed', 'failed', 'skipped')
+        AND created_at >= now() - ($2 || ' hours')::interval
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `;
+    try {
+      const r = await pool.query(sql, [chainId || null, hours]);
+      return r.rows.map((row) => {
+        const confirmed = row.confirmed || 0;
+        const failed    = row.failed    || 0;
+        const skipped   = row.skipped   || 0;
+        const total     = confirmed + failed + skipped;
+        const hourStart = row.hour_start instanceof Date
+          ? row.hour_start.toISOString()
+          : String(row.hour_start);
+        return {
+          hourStart,
+          confirmed,
+          failed,
+          skipped,
+          total,
+          // Percentage 0-100 (null when no settled events in the bucket).
+          successRate: total > 0 ? Math.round((confirmed / total) * 1000) / 10 : null,
+        };
+      });
+    } catch (e) {
+      console.error("[echo-store] getSuccessRateBuckets error:", e.message);
+      return null;
     }
   }
 
-  // IS_STAGING-gated seed: inserts demo rows so the staging Global echo log
-  // has varied entries to tap and inspect. Called from echo-logic.js once the
-  // chain_id is known (inside setChainId on first set). No-op in production.
-  // Idempotent — ON CONFLICT DO NOTHING means re-running on each deploy is safe.
+  // IS_STAGING-gated seed: inserts demo rows for both the success-rate chart
+  // (hourly buckets, idempotent per calendar day) and the transaction history
+  // log (fixed rows with varied statuses). Called from echo-logic.js once the
+  // chain_id is known. Idempotent throughout — ON CONFLICT DO NOTHING.
   async function seedStaging(chainId) {
     const IS_STAGING = process.env.USERNODE_ENV === "staging";
     if (!IS_STAGING || !isReady()) return;
+
+    // Hourly chart demo rows — success-rate buckets for the past 24h.
+    try {
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const now   = new Date();
+      const hourMs = 3_600_000;
+      const fakePubkey = "ut1stagingdemouser000000000000000000000000000000000";
+      let seeded = 0;
+
+      for (let h = 23; h >= 0; h--) {
+        const hourStart = Math.floor((now.getTime() - h * hourMs) / hourMs) * hourMs;
+        const hasFailure     = (h % 4 === 0);
+        const confirmedCount = hasFailure ? 6 : 7;
+
+        for (let i = 0; i < confirmedCount; i++) {
+          const tsMs = hourStart + i * 8 * 60_000;
+          const ts   = new Date(tsMs);
+          const txId = `staging-chart-${today}-h${h}-c${i}`;
+          const { rowCount } = await pool.query(
+            `INSERT INTO echo_events
+               (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+                status, request_ts, request_seen_at_ms,
+                echo_confirmed_ts, echo_confirmed_at_ms, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$10)
+             ON CONFLICT (request_tx_id) DO NOTHING`,
+            [txId, chainId || null, fakePubkey, 5, 4, "confirmed",
+             tsMs, tsMs + 30_000, tsMs + 31_000, ts]
+          );
+          seeded += rowCount || 0;
+        }
+
+        if (hasFailure) {
+          const tsMs = hourStart + confirmedCount * 8 * 60_000;
+          const ts   = new Date(tsMs);
+          const txId = `staging-chart-${today}-h${h}-fail`;
+          const { rowCount } = await pool.query(
+            `INSERT INTO echo_events
+               (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+                status, error, error_category, request_ts, request_seen_at_ms,
+                created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$10)
+             ON CONFLICT (request_tx_id) DO NOTHING`,
+            [txId, chainId || null, fakePubkey, 5, null, "failed",
+             "Staging demo failure", "permanent", tsMs, ts]
+          );
+          seeded += rowCount || 0;
+        }
+      }
+
+      if (seeded > 0) {
+        console.log(`[echo-store] seeded ${seeded} staging chart demo rows`);
+      }
+    } catch (e) {
+      console.error("[echo-store] seedStaging error:", e.message);
+    }
+
+    // Fixed demo log rows — varied entries for the transaction history view.
     const BASE = 1749996000000; // 2026-06-15 16:00 UTC
     const SENDER = "ut1demodemo000000000sender00000000aabbccddeeffgg";
     const rows = [
@@ -437,7 +532,15 @@ function createEchoStore(opts = {}) {
     if (seeded > 0) console.log(`[echo-store] seeded ${seeded} staging demo rows (chain=${chainId})`);
   }
 
-  return { init, isReady, persist, hydrate, queryHistory, queryStats, prune, close, seedStaging };
+  async function close() {
+    if (pruneTimer) clearInterval(pruneTimer);
+    if (pool) {
+      try { await pool.end(); } catch (_) {}
+    }
+  }
+
+  return { init, isReady, persist, hydrate, queryHistory, queryStats,
+           getSuccessRateBuckets, seedStaging, prune, close };
 }
 
 module.exports = createEchoStore;
