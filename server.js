@@ -38,6 +38,7 @@ const {
   createUsernamesCache,
   createNodeStatusProbe,
   createDappServerStatus,
+  discoverChainInfo,
 } = require("./lib/dapp-server");
 const createEcho = require("./echo-logic");
 
@@ -110,10 +111,20 @@ const echo = createEcho({
   isStaging: IS_STAGING,
   seedBaseline: ECHO_SEED_BASELINE,
 });
-// echo.start() runs the sidecar /wallet/signer ensureReady loop; chain
-// plumbing (recipient + sender pollers, backfill, mock drain) is in echoCache
-// below.
-echo.start();
+// echo.start() runs the sidecar /wallet/signer ensureReady loop + hydrates
+// the durable diagnostic log into memory; chain plumbing (recipient + sender
+// pollers, backfill, mock drain) is in echoCache below. We discover the
+// active chain id *first* (in chain mode) so the durable rows are stamped and
+// hydrated under the right chain_id. onChainReset keeps it current afterwards.
+(async () => {
+  if (!LOCAL_DEV) {
+    try {
+      const info = await discoverChainInfo();
+      if (info && info.chainId) echo.setChainId(info.chainId);
+    } catch (_) {}
+  }
+  echo.start();
+})();
 
 const echoCache = createAppStateCache({
   name: "echo",
@@ -123,8 +134,11 @@ const echoCache = createAppStateCache({
   handleRequest: echo.handleRequest,
   onChainReset(newId, oldId) {
     console.log(`[echo] chain reset ${oldId} -> ${newId}, resetting state`);
-    // Pass the new chain id as the metrics epoch so post-reset samples
-    // baseline independently and prior-epoch anomalies auto-resolve.
+    // Stamp new rows with the new chain id; the durable log keeps the old
+    // chain's rows (history is preserved, reads scope to the current chain).
+    // Also pass it as the metrics epoch so post-reset samples baseline
+    // independently and prior-epoch anomalies auto-resolve.
+    echo.setChainId(newId);
     echo.reset(newId);
   },
   localDev: LOCAL_DEV,
