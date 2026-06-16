@@ -208,6 +208,7 @@
       font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     }
     .status.sending  { background: var(--chip-bg); color: var(--accent); }
+    .status.checking { background: var(--chip-bg); color: var(--accent); }
     .status.pending  { background: var(--chip-bg); color: var(--accent); }
     .status.echoing  { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
     .status.confirmed { background: rgba(15, 118, 110, 0.15); color: var(--ok); }
@@ -260,7 +261,20 @@
       50%      { opacity: 0.55; }
     }
     .status.sending,
+    .status.checking,
     .status.echoing { animation: echoPulse 1.4s ease-in-out infinite; }
+
+    /* Auto-refresh pulse dot — shown on the latest card header while polling
+       is actively tracking pending echoes. Signals to the user that the app
+       is checking in the background without any manual action required. */
+    .auto-refresh-dot {
+      display: inline-block;
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent);
+      animation: echoPulse 1.4s ease-in-out infinite;
+      vertical-align: middle;
+      margin-left: 6px;
+    }
     .live-timer { font-variant-numeric: tabular-nums; color: var(--warn); }
     .live-timer::after {
       content: "…";
@@ -381,7 +395,7 @@
 
       <!-- Most recent attempt -->
       <div class="card" id="latestCard" style="display:none">
-        <h2>Latest attempt <span class="status" id="latestStatus">pending</span></h2>
+        <h2>Latest attempt <span class="status" id="latestStatus">pending</span><span class="auto-refresh-dot" id="autoRefreshDot" style="display:none"></span></h2>
         <div class="timing">
           <div class="label">You sent</div>
           <div class="val" id="latestSentAmount">—</div>
@@ -552,14 +566,19 @@
     }
 
     /* Derived display status for an entry. A transient-retrying entry is
-       shown as "retrying" even though its underlying status is "pending". */
+       shown as "retrying" even though its underlying status is "pending".
+       A "checking" entry (recovered from a page-reload interruption) is
+       shown as "checking" while we wait for the first server poll to
+       resolve its true status. */
     function displayStatus(entry) {
-      if (entry && entry.errorCategory === "transient" &&
+      if (!entry) return "pending";
+      if (entry.status === "checking") return "checking";
+      if (entry.errorCategory === "transient" &&
           entry.status !== "confirmed" && entry.status !== "failed" &&
           entry.status !== "skipped") {
         return "retrying";
       }
-      return entry ? entry.status : "pending";
+      return entry.status;
     }
 
     /* ── Standard helpers ─────────────────────────────────── */
@@ -675,6 +694,7 @@
     const latestMsg = document.getElementById("latestMsg");
     const latestErrDetail = document.getElementById("latestErrDetail");
     const latestBlocks = document.getElementById("latestBlocks");
+    const autoRefreshDot = document.getElementById("autoRefreshDot");
     const historyEl = document.getElementById("history");
     const globalLogEl = document.getElementById("globalLog");
     const loadMoreBtn = document.getElementById("loadMoreBtn");
@@ -721,22 +741,28 @@
         if (raw) history = JSON.parse(raw);
         if (!Array.isArray(history)) history = [];
       } catch (_) { history = []; }
-      // A "sending" entry persisted across a reload means we lost
-      // track of an in-flight tx (no requestTxId yet, can't poll).
-      // Mark it failed so the UI doesn't show a perpetually-spinning
-      // live timer for an attempt we can't recover.
+      // A "sending" entry persisted across a reload means we lost track of an
+      // in-flight tx. If it has a requestTxId we can try to recover its real
+      // status from the server on the first poll cycle; mark it "checking"
+      // and add it to pendingByTxId. Without a txId (page closed before the
+      // bridge returned) there's nothing to look up, so mark it failed.
       let mutated = false;
       for (const h of history) {
         if (h.status === "sending") {
-          h.status = "failed";
-          h.error = h.error || "Page reloaded before send confirmed";
+          if (h.requestTxId) {
+            h.status = "checking";
+            pendingByTxId.set(h.requestTxId, h);
+          } else {
+            h.status = "failed";
+            h.error = h.error || "Page reloaded before send confirmed";
+          }
           mutated = true;
         }
       }
       if (mutated) {
         try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_MAX))); } catch (_) {}
       }
-      // Re-attach in-flight items
+      // Re-attach in-flight items (pending/echoing carry over from prior sessions)
       for (const h of history) {
         if (h.requestTxId && (h.status === "pending" || h.status === "echoing")) {
           pendingByTxId.set(h.requestTxId, h);
@@ -1366,21 +1392,23 @@
       if (echoChip) latestBlocks.appendChild(echoChip);
       latestBlocks.style.display = (reqChip || echoChip) ? "flex" : "none";
 
-      // Retry indicator (transient errors only): "Retrying… (attempt 3/30,
-      // next in 42s)". next-retry countdown is derived from nextRetryAtMs.
+      // Retry indicator (transient errors only): "Retrying in 28s… (attempt 3/30)".
+      // The 1-second countdown interval keeps this live between server polls.
       if (entry.errorCategory === "transient" && dStatus === "retrying") {
-        let txt = "Retrying…";
-        const parts = [];
-        if (entry.retryAttempts) parts.push("attempt " + entry.retryAttempts + "/30");
-        if (entry.nextRetryAtMs) {
-          const secs = Math.max(0, Math.round((entry.nextRetryAtMs - Date.now()) / 1000));
-          parts.push("next in " + secs + "s");
-        }
-        if (parts.length) txt += " (" + parts.join(", ") + ")";
+        const secs = entry.nextRetryAtMs != null
+          ? Math.max(0, Math.round((entry.nextRetryAtMs - Date.now()) / 1000))
+          : null;
+        let txt = (secs != null && secs > 0) ? "Retrying in " + secs + "s…" : "Retrying…";
+        if (entry.retryAttempts) txt += " (attempt " + entry.retryAttempts + "/30)";
         latestRetryText.textContent = txt;
         latestRetry.style.display = "flex";
       } else {
         latestRetry.style.display = "none";
+      }
+
+      // Auto-refresh pulse dot: visible while any echo is being actively polled.
+      if (autoRefreshDot) {
+        autoRefreshDot.style.display = pendingByTxId.size > 0 ? "inline-block" : "none";
       }
 
       // Friendly outcome message + raw detail. Styled by category:
@@ -1858,7 +1886,10 @@
 
     /* ── Server state polling ─────────────────────────────── */
     async function pollServerState() {
-      if (pendingByTxId.size === 0) return;
+      // Fire when there are actively-tracked echoes OR when any "checking"
+      // entry (recovered from a page-reload) still needs its status resolved.
+      const hasCheckingEntry = history.some(h => h.status === "checking");
+      if (pendingByTxId.size === 0 && !hasCheckingEntry) return;
       let resp;
       try {
         const r = await fetch("/__echo/state", {
@@ -1883,7 +1914,41 @@
 
       for (const [txId, entry] of pendingByTxId) {
         const ev = byId.get(txId);
-        if (!ev) continue;
+        if (!ev) {
+          // "checking" entries not found on the server can't be recovered
+          // (either too old for the server's event window, or unresolvable).
+          if (entry.status === "checking") {
+            entry.status = "failed";
+            entry.error = entry.error || "Page reloaded before send confirmed";
+            pendingByTxId.delete(txId);
+            dirty = true;
+            if (history[0] === entry) latestUpdated = entry;
+          }
+          continue;
+        }
+
+        // "checking" entry found on the server: copy its real state.
+        if (entry.status === "checking") {
+          if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
+          if (entry.requestBlockHeight == null && typeof ev.requestBlockHeight === "number")
+            entry.requestBlockHeight = ev.requestBlockHeight;
+          if (!entry.requestBlockHash && typeof ev.requestBlockHash === "string")
+            entry.requestBlockHash = ev.requestBlockHash;
+          if (entry.echoBlockHeight == null && typeof ev.echoBlockHeight === "number")
+            entry.echoBlockHeight = ev.echoBlockHeight;
+          if (!entry.echoBlockHash && typeof ev.echoBlockHash === "string")
+            entry.echoBlockHash = ev.echoBlockHash;
+          entry.errorCategory = ev.errorCategory || null;
+          entry.nextRetryAtMs = ev.nextRetryAtMs != null ? ev.nextRetryAtMs : null;
+          if (ev.retryAttempts != null) entry.retryAttempts = ev.retryAttempts;
+          if (ev.error != null) entry.errorRaw = ev.error;
+          entry.status = ev.status;
+          const isTerminal = ev.status === "confirmed" || ev.status === "failed" || ev.status === "skipped";
+          if (isTerminal) pendingByTxId.delete(txId);
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+          continue;
+        }
 
         if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
         // Server-side block heights + hashes. requestBlock* is normally
@@ -1965,6 +2030,17 @@
           entry.errorCategory = "transient";
           if (history[0] === entry) latestUpdated = entry;
           if (_pbTrackingTxId === txId) pbOutcome = { kind: "retry", txId, attempt: ev.retryAttempts };
+        }
+      }
+
+      // Resolve any "checking" entries that aren't in pendingByTxId (they have
+      // no requestTxId so they can't be matched against server events).
+      for (const h of history) {
+        if (h.status === "checking") {
+          h.status = "failed";
+          h.error = h.error || "Page reloaded before send confirmed";
+          dirty = true;
+          if (history[0] === h) latestUpdated = h;
         }
       }
 
@@ -2068,6 +2144,20 @@
       // even when there are no pending echoes (pollServerState idles then).
       setInterval(pollHealth, 10000);
       pollHealth();
+
+      // 1-second countdown tick: updates the "Retrying in Xs…" line on the
+      // latest card between server polls so the countdown stays live.
+      // No HTTP call — pure display-layer math on nextRetryAtMs.
+      setInterval(() => {
+        const top = history[0];
+        if (!top || !top.nextRetryAtMs || displayStatus(top) !== "retrying") return;
+        const secs = Math.max(0, Math.round((top.nextRetryAtMs - Date.now()) / 1000));
+        const attPart = top.retryAttempts ? " (attempt " + top.retryAttempts + "/30)" : "";
+        latestRetryText.textContent = secs > 0
+          ? "Retrying in " + secs + "s…" + attPart
+          : "Retrying…" + attPart;
+        if (latestRetry.style.display !== "flex") latestRetry.style.display = "flex";
+      }, 1000);
     })();
   </script>
 </body>
