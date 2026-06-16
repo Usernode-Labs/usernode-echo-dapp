@@ -18,6 +18,18 @@
       "description": "Sidecar usernode RPC endpoint. Defaults to the in-network node service.",
       "required": false,
       "default": "http://usernode-node:3000"
+    },
+    {
+      "key": "ECHO_DATA_DIR",
+      "description": "Directory for the anomaly-detection SQLite store. Should point at a mounted volume so historical baselines survive restarts. Falls back to in-memory (non-durable) if unwritable.",
+      "required": false,
+      "default": "/app/data"
+    },
+    {
+      "key": "ECHO_SEED_BASELINE",
+      "description": "Set to 1 to seed a synthetic anomaly-detection baseline on boot. Staging only (ignored in production) so the detector has history to compare against in a fresh PR container.",
+      "required": false,
+      "default": "0"
     }
   ]
 }
