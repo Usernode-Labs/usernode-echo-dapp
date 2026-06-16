@@ -14,6 +14,7 @@
   <script src="https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js"></script>
   <script src="/usernode-usernames.js?v=__BUILD_VERSION__"></script>
   <script src="/usernode-loading.js?v=__BUILD_VERSION__"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>UsernodeLoading.init({ appName: "Echo", streamKey: "echo" });</script>
   <meta name="x-app-version" content="__BUILD_VERSION__" />
   <style>
@@ -119,6 +120,22 @@
       cursor: pointer;
     }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* Amount field + inline "Max" control. The wrapper is the flex child
+       (so Send still sits beside it via .row); the input fills the wrapper
+       and reserves right padding so typed digits never slide under Max. */
+    .amount-wrap { position: relative; flex: 1 1 auto; display: flex; }
+    .amount-wrap input[type="number"] { padding-right: 66px; }
+    .max-btn {
+      position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+      min-width: 46px; min-height: 32px; padding: 4px 10px;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--border); border-radius: 6px;
+      cursor: pointer; line-height: 1;
+    }
+    .max-btn:hover { border-color: var(--accent); }
+    .max-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .max-btn.loading { color: var(--muted); }
     .hint {
       font-size: 12px; color: var(--muted); margin-top: 8px;
     }
@@ -143,7 +160,8 @@
        see *something* is still happening even though chain confirmation can
        take 30-60s and we have no incremental progress signal until the echo
        lands. */
-    .tx-progress-fill.echoing {
+    .tx-progress-fill.echoing,
+    .tx-progress-fill.retrying {
       background:
         repeating-linear-gradient(
           -45deg,
@@ -190,18 +208,73 @@
       font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     }
     .status.sending  { background: var(--chip-bg); color: var(--accent); }
+    .status.checking { background: var(--chip-bg); color: var(--accent); }
     .status.pending  { background: var(--chip-bg); color: var(--accent); }
     .status.echoing  { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
     .status.confirmed { background: rgba(15, 118, 110, 0.15); color: var(--ok); }
     .status.skipped  { background: var(--border); color: var(--muted); }
     .status.failed   { background: rgba(200, 30, 30, 0.15); color: var(--err); }
+    .status.retrying { background: rgba(202, 138, 4, 0.15); color: var(--warn); }
+
+    /* Retry / message / error-detail lines on the latest card */
+    .retry-line {
+      margin-top: 10px; font-size: 12px; color: var(--warn);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .retry-line .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; flex: 0 0 auto;
+      animation: echoPulse 1.4s ease-in-out infinite;
+    }
+    .latest-msg { margin-top: 10px; font-size: 13px; line-height: 1.4; }
+    .latest-msg.skip { color: var(--muted); }
+    .latest-msg.failed { color: var(--err); }
+    .latest-msg.transient { color: var(--warn); }
+    .err-detail {
+      margin-top: 6px; font-size: 11px; color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-word;
+    }
+
+    /* Diagnostics strip (global aggregate stats) */
+    .diag-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .diag-cell { text-align: center; padding: 4px; }
+    .diag-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .diag-label {
+      font-size: 10px; color: var(--muted); margin-top: 2px;
+      text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .diag-meta { margin-top: 10px; font-size: 11px; color: var(--muted); text-align: center; }
+
+    /* Global echo log */
+    .section-sub { font-size: 11px; color: var(--muted); margin: -4px 0 10px; }
+    .load-more {
+      display: block; width: 100%; margin-top: 12px;
+      padding: 9px 12px; font-size: 13px; font-weight: 600;
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+    }
+    .load-more:disabled { opacity: 0.5; cursor: default; }
 
     @keyframes echoPulse {
       0%, 100% { opacity: 1; }
       50%      { opacity: 0.55; }
     }
     .status.sending,
+    .status.checking,
     .status.echoing { animation: echoPulse 1.4s ease-in-out infinite; }
+
+    /* Auto-refresh pulse dot — shown on the latest card header while polling
+       is actively tracking pending echoes. Signals to the user that the app
+       is checking in the background without any manual action required. */
+    .auto-refresh-dot {
+      display: inline-block;
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent);
+      animation: echoPulse 1.4s ease-in-out infinite;
+      vertical-align: middle;
+      margin-left: 6px;
+    }
     .live-timer { font-variant-numeric: tabular-nums; color: var(--warn); }
     .live-timer::after {
       content: "…";
@@ -276,9 +349,13 @@
         <h2>Send</h2>
         <label for="amountInput">Amount (≥ 2)</label>
         <div class="row">
-          <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
+          <div class="amount-wrap">
+            <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
+            <button id="maxBtn" type="button" class="max-btn" aria-label="Use full available balance">Max</button>
+          </div>
           <button id="sendBtn" class="primary">Send</button>
         </div>
+        <div class="hint" id="maxHint" style="display:none"></div>
         <div class="tx-progress hide" id="txProgress">
           <div class="tx-progress-track"><div class="tx-progress-fill"></div></div>
           <div class="tx-progress-label">Sending...</div>
@@ -286,9 +363,39 @@
         <div class="hint" id="errMsg" style="display:none"></div>
       </div>
 
+      <!-- Diagnostics — global aggregate stats from /__echo/history -->
+      <div class="card" id="diagCard" style="display:none">
+        <h2>Diagnostics</h2>
+        <div class="diag-grid">
+          <div class="diag-cell">
+            <div class="diag-val" id="diagSuccess">—</div>
+            <div class="diag-label">Success rate</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="diagMedian">—</div>
+            <div class="diag-label">Median round-trip</div>
+          </div>
+          <div class="diag-cell">
+            <div class="diag-val" id="diagP95">—</div>
+            <div class="diag-label">p95 round-trip</div>
+          </div>
+        </div>
+        <div class="diag-meta" id="diagMeta"></div>
+      </div>
+
+      <!-- Success Rate Over Time chart -->
+      <div class="card" id="successRateCard" style="display:none">
+        <h2>Success Rate Over Time</h2>
+        <div class="section-sub">Last 24 h · hourly buckets</div>
+        <div id="successRateNoData" class="history-empty" style="display:none">No data yet</div>
+        <div id="successRateChartWrap" style="position:relative;height:200px;display:none">
+          <canvas id="successRateChart"></canvas>
+        </div>
+      </div>
+
       <!-- Most recent attempt -->
       <div class="card" id="latestCard" style="display:none">
-        <h2>Latest attempt <span class="status" id="latestStatus">pending</span></h2>
+        <h2>Latest attempt <span class="status" id="latestStatus">pending</span><span class="auto-refresh-dot" id="autoRefreshDot" style="display:none"></span></h2>
         <div class="timing">
           <div class="label">You sent</div>
           <div class="val" id="latestSentAmount">—</div>
@@ -324,16 +431,33 @@
              request/echo block heights become known; hidden otherwise. -->
         <div class="block-chips" id="latestBlocks" style="display:none"></div>
 
-        <div class="hint err" id="latestError" style="display:none"></div>
+        <!-- Transient-retry indicator: "Retrying… (attempt 3/30, next in 42s)" -->
+        <div class="retry-line" id="latestRetry" style="display:none">
+          <span class="dot"></span><span id="latestRetryText"></span>
+        </div>
+
+        <!-- Friendly outcome message (skip / failed / transient). The raw
+             server string is kept below it as a muted monospace detail. -->
+        <div class="latest-msg" id="latestMsg" style="display:none"></div>
+        <div class="err-detail" id="latestErrDetail" style="display:none"></div>
       </div>
 
-      <!-- History -->
+      <!-- Your attempts (per-device, localStorage) -->
       <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <h2 style="margin:0">Recent attempts</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <h2 style="margin:0">Your attempts</h2>
           <button id="exportCsvBtn" style="display:none;font-size:12px;color:var(--muted);background:none;border:1px solid var(--muted);border-radius:4px;padding:3px 10px;cursor:pointer">Export CSV</button>
         </div>
+        <div class="section-sub">Saved on this device only.</div>
         <div id="history"></div>
+      </div>
+
+      <!-- Global echo log (durable, server-side, shared by all viewers) -->
+      <div class="card">
+        <h2>Global echo log</h2>
+        <div class="section-sub">Recent echoes across every viewer — survives restarts.</div>
+        <div id="globalLog"></div>
+        <button class="load-more" id="loadMoreBtn" style="display:none">Load more</button>
       </div>
 
       <!-- Info -->
@@ -341,6 +465,7 @@
         <h2>How this works</h2>
         <p>You send <code>N</code> tokens to the echo dapp's address. A server-side process polls the chain, sees your transaction, and uses the sidecar's <code>/wallet/send</code> RPC to return <code>N-1</code> tokens.</p>
         <p>The wall-clock numbers above measure your phone's view of the round-trip; the server-side breakdown shows where the time is going (poll lag → RPC submit → chain confirmation).</p>
+        <p>The <strong>Global echo log</strong> is a shared, public diagnostic feed recorded by the server, while <strong>Your attempts</strong> are stored only in this browser on this device.</p>
       </div>
 
       <div class="footer-note">
@@ -399,17 +524,65 @@
     // when no upstream is configured (e.g. an offline dev shell with the
     // env var blanked) — UI suppresses the block links in that case.
     const EXPLORER_PUBLIC_BASE = "__EXPLORER_PUBLIC_BASE__";
+    // Server-substituted: "true" inside a staging container, "false" in
+    // production. Gates the ?demo=1 Max-balance override below so production
+    // can never fake a balance.
+    const ECHO_IS_STAGING = ("__ECHO_IS_STAGING__" === "true");
     // Bump STORAGE_VERSION whenever the persisted history shape changes
     // (or any other echo:* key's shape changes). loadHistory() purges
     // older versions on startup so stale entries from previous deploys —
     // most painfully, a stuck "echoing" entry whose server-side state is
     // long gone — can't poison the new UI.
-    const STORAGE_VERSION = 2;
+    // v3: entries gained errorCategory / nextRetryAtMs / retryAttempts / errorRaw.
+    const STORAGE_VERSION = 3;
     const HISTORY_KEY_PREFIX = "echo:history:v";
     const HISTORY_KEY = HISTORY_KEY_PREFIX + STORAGE_VERSION;
     const HISTORY_MAX = 20;
     const STATE_POLL_MS = 2000;
+    // Global echo log + diagnostics poll cadence (slower than state poll).
+    const HISTORY_POLL_MS = 5000;
+    const GLOBAL_LOG_PAGE = 25;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
+
+    /* Map raw sidecar/server error strings to a short human explanation.
+       The raw string is still shown as a muted detail line. */
+    function friendlyError(raw) {
+      if (!raw) return null;
+      const s = String(raw);
+      if (/no .*UTXOs?.* for owner|requires a single base-currency UTXO/i.test(s))
+        return "Echo wallet is briefly out of funds — retrying.";
+      if (/no signer configured|signer not configured/i.test(s))
+        return "Echo signer reconnecting — retrying.";
+      if (/tracked owner not registered/i.test(s))
+        return "Echo wallet registering with the node — retrying.";
+      if (/wallet send already pending/i.test(s))
+        return "Another echo is mid-send — retrying.";
+      if (/sidecar not ready/i.test(s))
+        return "Echo backend warming up — retrying.";
+      if (/queued tx not included/i.test(s))
+        return "Echo transaction dropped before inclusion — requeued.";
+      if (/amount must be ≥ 2|amount must be >= 2/i.test(s))
+        return "Amount must be ≥ 2 — the echo returns N-1, so 1 or less leaves nothing to send back.";
+      if (/gave up after/i.test(s))
+        return "Echo failed after several retries.";
+      return s;
+    }
+
+    /* Derived display status for an entry. A transient-retrying entry is
+       shown as "retrying" even though its underlying status is "pending".
+       A "checking" entry (recovered from a page-reload interruption) is
+       shown as "checking" while we wait for the first server poll to
+       resolve its true status. */
+    function displayStatus(entry) {
+      if (!entry) return "pending";
+      if (entry.status === "checking") return "checking";
+      if (entry.errorCategory === "transient" &&
+          entry.status !== "confirmed" && entry.status !== "failed" &&
+          entry.status !== "skipped") {
+        return "retrying";
+      }
+      return entry.status;
+    }
 
     /* ── Standard helpers ─────────────────────────────────── */
     function extractTxId(sendResult) {
@@ -501,6 +674,8 @@
     /* ── DOM refs ─────────────────────────────────────────── */
     const amountInput = document.getElementById("amountInput");
     const sendBtn = document.getElementById("sendBtn");
+    const maxBtn = document.getElementById("maxBtn");
+    const maxHint = document.getElementById("maxHint");
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
@@ -517,11 +692,22 @@
     const serverPollLag = document.getElementById("serverPollLag");
     const serverEchoQueue = document.getElementById("serverEchoQueue");
     const serverChainRtt = document.getElementById("serverChainRtt");
-    const latestError = document.getElementById("latestError");
+    const latestRetry = document.getElementById("latestRetry");
+    const latestRetryText = document.getElementById("latestRetryText");
+    const latestMsg = document.getElementById("latestMsg");
+    const latestErrDetail = document.getElementById("latestErrDetail");
     const latestBlocks = document.getElementById("latestBlocks");
+    const autoRefreshDot = document.getElementById("autoRefreshDot");
     const historyEl = document.getElementById("history");
     const exportCsvBtn = document.getElementById("exportCsvBtn");
     exportCsvBtn.addEventListener("click", exportCsv);
+    const globalLogEl = document.getElementById("globalLog");
+    const loadMoreBtn = document.getElementById("loadMoreBtn");
+    const diagCard = document.getElementById("diagCard");
+    const diagSuccess = document.getElementById("diagSuccess");
+    const diagMedian = document.getElementById("diagMedian");
+    const diagP95 = document.getElementById("diagP95");
+    const diagMeta = document.getElementById("diagMeta");
 
     appPubkeyText.textContent = shortPk(APP_PUBKEY);
 
@@ -534,6 +720,11 @@
     let sendGeneration = 0;
     let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
     let pendingByTxId = new Map(); // requestTxId -> history entry
+
+    // Global echo log (durable, server-side). Accumulated across "Load more".
+    let globalLog = [];            // array of server event rows
+    let globalCursor = null;       // nextCursor for pagination
+    let globalLoading = false;
 
     function purgeOldHistoryVersions() {
       try {
@@ -555,22 +746,28 @@
         if (raw) history = JSON.parse(raw);
         if (!Array.isArray(history)) history = [];
       } catch (_) { history = []; }
-      // A "sending" entry persisted across a reload means we lost
-      // track of an in-flight tx (no requestTxId yet, can't poll).
-      // Mark it failed so the UI doesn't show a perpetually-spinning
-      // live timer for an attempt we can't recover.
+      // A "sending" entry persisted across a reload means we lost track of an
+      // in-flight tx. If it has a requestTxId we can try to recover its real
+      // status from the server on the first poll cycle; mark it "checking"
+      // and add it to pendingByTxId. Without a txId (page closed before the
+      // bridge returned) there's nothing to look up, so mark it failed.
       let mutated = false;
       for (const h of history) {
         if (h.status === "sending") {
-          h.status = "failed";
-          h.error = h.error || "Page reloaded before send confirmed";
+          if (h.requestTxId) {
+            h.status = "checking";
+            pendingByTxId.set(h.requestTxId, h);
+          } else {
+            h.status = "failed";
+            h.error = h.error || "Page reloaded before send confirmed";
+          }
           mutated = true;
         }
       }
       if (mutated) {
         try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_MAX))); } catch (_) {}
       }
-      // Re-attach in-flight items
+      // Re-attach in-flight items (pending/echoing carry over from prior sessions)
       for (const h of history) {
         if (h.requestTxId && (h.status === "pending" || h.status === "echoing")) {
           pendingByTxId.set(h.requestTxId, h);
@@ -739,6 +936,23 @@
       tick();
     }
 
+    /* Transient retry in progress — the echo send failed for a transient
+       reason and is in backoff. Distinct striped state + label from the
+       normal "waiting for echo" phase so the user knows it's recovering. */
+    function retryPhaseProgressBar(trackingTxId, attempt) {
+      pbCancelHide();
+      stopProgressTick();
+      pbResetLabelCache();
+      _pbPhase = "echoing"; // reuse the waiting-phase machinery
+      _pbTrackingTxId = trackingTxId || null;
+      const el = pbEl();
+      if (el) el.classList.remove("hide");
+      const fill = pbFill();
+      if (fill) { fill.className = "tx-progress-fill retrying"; fill.style.width = "95%"; }
+      const label = "Retrying echo…" + (attempt ? " (attempt " + attempt + "/30)" : "");
+      pbSetLabel(label, "tx-progress-label warn", true);
+    }
+
     /* Echo arrived — show green completion + total round-trip, then hide. */
     function completeEchoPhaseProgressBar(totalRoundTripMs) {
       stopProgressTick();
@@ -793,6 +1007,7 @@
       sending = !!v;
       amountInput.disabled = !!v;
       sendBtn.disabled = !!v;
+      if (maxBtn) maxBtn.disabled = !!v;
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
         // echo is still pending. The previous entry's eventual confirmation
@@ -813,6 +1028,129 @@
       errMsg.classList.add("err");
     }
     function clearError() { errMsg.style.display = "none"; }
+
+    /* ── Available balance (powers the Max button) ─────────── */
+    // There is no balance API on this stack — the bridge exposes only
+    // getNodeAddress / sendTransaction / signMessage / getTransactions. So we
+    // derive the user's available balance by summing their transaction
+    // history: credits TO their address minus debits FROM it. Paged and
+    // bounded so a long history can't hang the UI. Field normalization
+    // mirrors echo-logic.js (from_pubkey|from|source, destination_pubkey|to|
+    // destination, amount).
+    const BALANCE_PAGE_LIMIT = 50;
+    const BALANCE_MAX_PAGES = 20;   // ≤1000 tx scanned; caps cost on huge histories
+    let availableBalance = null;    // whole tokens, or null = unknown/unloaded/failed
+    let balanceAddr = null;         // resolved wallet address, or null if none
+    let balancePromise = null;      // in-flight refresh (shared by concurrent Max clicks)
+    let balanceResolvedOnce = false;
+    let balanceDemo = false;        // staging/mock ?demo=1 override (no-op in prod)
+
+    function txTo(tx) { return tx.destination_pubkey || tx.to || tx.destination || null; }
+    function txFrom(tx) { return tx.from_pubkey || tx.from || tx.source || null; }
+
+    async function resolveWalletAddress() {
+      try {
+        if (typeof window.getNodeAddress === "function") {
+          const a = await window.getNodeAddress();
+          const s = a && String(a).trim();
+          return s || null;
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    async function deriveBalanceFromHistory(addr) {
+      let balance = 0, cursor = null, pages = 0;
+      while (pages < BALANCE_MAX_PAGES) {
+        const filter = { account: addr, limit: BALANCE_PAGE_LIMIT };
+        if (cursor) filter.cursor = cursor;
+        const resp = await window.getTransactions(filter);
+        const items = (resp && (resp.items || resp.transactions || resp.txs)) || [];
+        for (const tx of items) {
+          const amt = Number(tx.amount);
+          if (!Number.isFinite(amt)) continue;
+          if (txTo(tx) === addr) balance += amt;
+          else if (txFrom(tx) === addr) balance -= amt;
+        }
+        pages++;
+        const hasMore = !!(resp && (resp.has_more || resp.hasMore));
+        cursor = resp && (resp.next_cursor || resp.nextCursor);
+        if (!hasMore || !cursor) break;
+      }
+      if (pages >= BALANCE_MAX_PAGES) {
+        console.warn("[echo] balance: hit " + BALANCE_MAX_PAGES +
+          "-page cap; value is a lower-bound over recent transactions");
+      }
+      return Math.max(0, Math.floor(balance));
+    }
+
+    // Recompute availableBalance. Returns the in-flight promise so a Max
+    // click that lands before the first load completes can await the same
+    // fetch instead of starting a second one.
+    function refreshAvailableBalance(force) {
+      if (balancePromise && !force) return balancePromise;
+      const p = (async () => {
+        if (balanceDemo) { balanceAddr = "demo"; availableBalance = 137; return availableBalance; }
+        const addr = await resolveWalletAddress();
+        balanceAddr = addr;
+        if (!addr) { availableBalance = null; return null; }
+        try {
+          availableBalance = await deriveBalanceFromHistory(addr);
+        } catch (e) {
+          console.warn("[echo] balance fetch failed: " + (e && e.message ? e.message : e));
+          availableBalance = null;
+        }
+        return availableBalance;
+      })();
+      balancePromise = p;
+      p.then(() => {}, () => {}).then(() => {
+        balanceResolvedOnce = true;
+        if (balancePromise === p) balancePromise = null;
+        updateMaxVisibility();
+      });
+      return p;
+    }
+
+    function updateMaxVisibility() {
+      if (!maxBtn) return;
+      // Hide entirely once we know there's no resolvable wallet address
+      // (e.g. desktop QR fallback with no linked pubkey) — never leave a
+      // non-functional control on screen.
+      const noWallet = balanceResolvedOnce && !balanceDemo && balanceAddr == null;
+      maxBtn.style.display = noWallet ? "none" : "";
+    }
+
+    function setMaxLoading(on) {
+      if (!maxBtn) return;
+      maxBtn.classList.toggle("loading", !!on);
+      maxBtn.textContent = on ? "…" : "Max";
+    }
+
+    function showMaxHint(msg) {
+      if (!maxHint) return;
+      maxHint.textContent = msg || "";
+      maxHint.style.display = msg ? "block" : "none";
+    }
+
+    async function onMaxClick() {
+      if (sending) return;
+      showMaxHint("");
+      let bal = availableBalance;
+      if (bal == null) {
+        // Not loaded yet (or a prior fetch failed) — fetch now with a spinner.
+        setMaxLoading(true);
+        maxBtn.disabled = true;
+        try { bal = await refreshAvailableBalance(true); }
+        finally { setMaxLoading(false); maxBtn.disabled = sending; }
+      }
+      if (balanceAddr == null && !balanceDemo) return; // no wallet — button is hidden
+      if (bal == null) { showMaxHint("Couldn't load your balance — tap Max to retry."); return; }
+      if (bal < 2) { showMaxHint("Balance too low to echo (need ≥ 2)."); return; }
+      amountInput.value = String(bal);
+      clearError();
+      // Let any listeners (and native number-input UI) react to the change.
+      amountInput.dispatchEvent(new Event("input", { bubbles: true }));
+    }
 
     /* ── Send flow ────────────────────────────────────────── */
     sendBtn.addEventListener("click", async () => {
@@ -851,6 +1189,10 @@
         status: "sending",
         echoAmount: null,
         error: null,
+        errorRaw: null,
+        errorCategory: null,
+        nextRetryAtMs: null,
+        retryAttempts: 0,
         server: null,
         confirmedAtWall: null,
         _confirmedAtPerf: null,
@@ -979,14 +1321,19 @@
       // counter until pollServerState() sees the echo land.
       if (entry.status === "echoing") startEchoPhaseProgressBar(entry.requestTxId);
       else hideProgressBarNow();
+
+      // The send changed the user's balance — refresh so a subsequent Max
+      // reflects it. Best-effort; the new value lands when it lands.
+      refreshAvailableBalance(true);
     });
 
     /* ── Render ───────────────────────────────────────────── */
     function renderLatest(entry) {
       if (!entry) return;
       latestCard.style.display = "block";
-      latestStatus.className = "status " + entry.status;
-      latestStatus.textContent = entry.status;
+      const dStatus = displayStatus(entry);
+      latestStatus.className = "status " + dStatus;
+      latestStatus.textContent = dStatus;
       latestSentAmount.textContent = entry.sentAmount + " tokens";
       latestEchoAmount.textContent = entry.echoAmount != null
         ? entry.echoAmount + " tokens"
@@ -1050,11 +1397,44 @@
       if (echoChip) latestBlocks.appendChild(echoChip);
       latestBlocks.style.display = (reqChip || echoChip) ? "flex" : "none";
 
-      if (entry.error) {
-        latestError.style.display = "block";
-        latestError.textContent = entry.error;
+      // Retry indicator (transient errors only): "Retrying in 28s… (attempt 3/30)".
+      // The 1-second countdown interval keeps this live between server polls.
+      if (entry.errorCategory === "transient" && dStatus === "retrying") {
+        const secs = entry.nextRetryAtMs != null
+          ? Math.max(0, Math.round((entry.nextRetryAtMs - Date.now()) / 1000))
+          : null;
+        let txt = (secs != null && secs > 0) ? "Retrying in " + secs + "s…" : "Retrying…";
+        if (entry.retryAttempts) txt += " (attempt " + entry.retryAttempts + "/30)";
+        latestRetryText.textContent = txt;
+        latestRetry.style.display = "flex";
       } else {
-        latestError.style.display = "none";
+        latestRetry.style.display = "none";
+      }
+
+      // Auto-refresh pulse dot: visible while any echo is being actively polled.
+      if (autoRefreshDot) {
+        autoRefreshDot.style.display = pendingByTxId.size > 0 ? "inline-block" : "none";
+      }
+
+      // Friendly outcome message + raw detail. Styled by category:
+      // skip = neutral info, failed = red, transient = amber.
+      const cat = entry.errorCategory;
+      const raw = entry.errorRaw || entry.error || null;
+      if (raw && (cat === "skip" || cat === "permanent" || cat === "transient")) {
+        const cls = cat === "permanent" ? "failed" : (cat === "skip" ? "skip" : "transient");
+        latestMsg.className = "latest-msg " + cls;
+        latestMsg.textContent = friendlyError(raw);
+        latestMsg.style.display = "block";
+        // Only surface the raw string when it differs from the friendly text.
+        if (friendlyError(raw) !== raw) {
+          latestErrDetail.textContent = raw;
+          latestErrDetail.style.display = "block";
+        } else {
+          latestErrDetail.style.display = "none";
+        }
+      } else {
+        latestMsg.style.display = "none";
+        latestErrDetail.style.display = "none";
       }
 
       // Run the live timer for either in-flight phase ("sending" =
@@ -1174,6 +1554,40 @@
       URL.revokeObjectURL(url);
     }
 
+    /* Shared row builder for both "Your attempts" and the "Global echo log".
+       `spec` is a normalized shape:
+         { sentAmount, echoAmount, statusText, totalText,
+           blockHeight, blockHash, blockLabel } */
+    function buildAttemptRow(spec) {
+      const row = document.createElement("div");
+      row.className = "history-row";
+
+      const left = document.createElement("div");
+      left.className = "left";
+      const amt = document.createElement("span");
+      amt.className = "amount";
+      amt.textContent = spec.sentAmount + " → " + (spec.echoAmount != null ? spec.echoAmount : "?");
+      const status = document.createElement("span");
+      status.className = "status " + spec.statusText;
+      status.textContent = spec.statusText;
+      status.style.marginLeft = "8px";
+      left.appendChild(amt);
+      left.appendChild(status);
+
+      const right = document.createElement("div");
+      right.className = "right";
+      const totalEl = document.createElement("div");
+      totalEl.textContent = spec.totalText;
+      right.appendChild(totalEl);
+
+      const chip = buildBlockChip(spec.blockLabel, spec.blockHeight, spec.blockHash);
+      if (chip) right.appendChild(chip);
+
+      row.appendChild(left);
+      row.appendChild(right);
+      return row;
+    }
+
     function renderHistory() {
       historyEl.innerHTML = "";
       exportCsvBtn.style.display = history.length > 0 ? "" : "none";
@@ -1185,45 +1599,262 @@
         return;
       }
       for (const h of history) {
-        const row = document.createElement("div");
-        row.className = "history-row";
-
-        const left = document.createElement("div");
-        left.className = "left";
-        const amt = document.createElement("span");
-        amt.className = "amount";
-        amt.textContent = h.sentAmount + " → " + (h.echoAmount != null ? h.echoAmount : "?");
-        const status = document.createElement("span");
-        status.className = "status " + h.status;
-        status.textContent = h.status;
-        status.style.marginLeft = "8px";
-        left.appendChild(amt);
-        left.appendChild(status);
-
-        const right = document.createElement("div");
-        right.className = "right";
         const totalText = (h.sentLatencyMs != null && h.echoLatencyMs != null)
           ? fmtMs(h.sentLatencyMs + h.echoLatencyMs)
           : (h.status === "skipped" || h.status === "failed" ? "—" : "…");
-        const totalEl = document.createElement("div");
-        totalEl.textContent = totalText;
-        right.appendChild(totalEl);
-
-        // Block chip (echo block preferred; falls back to request block
-        // when the echo isn't on chain yet — typical for an entry still
-        // in flight). Skipped/failed entries that never produced an echo
-        // block get a request-block chip when one is known.
+        // Echo block preferred; falls back to the request block while in flight.
         const useEcho = h.echoBlockHeight != null;
-        const histChip = buildBlockChip(
-          useEcho ? "Echo" : "Request",
-          useEcho ? h.echoBlockHeight : h.requestBlockHeight,
-          useEcho ? h.echoBlockHash : h.requestBlockHash
-        );
-        if (histChip) right.appendChild(histChip);
+        historyEl.appendChild(buildAttemptRow({
+          sentAmount: h.sentAmount,
+          echoAmount: h.echoAmount,
+          statusText: displayStatus(h),
+          totalText,
+          blockLabel: useEcho ? "Echo" : "Request",
+          blockHeight: useEcho ? h.echoBlockHeight : h.requestBlockHeight,
+          blockHash: useEcho ? h.echoBlockHash : h.requestBlockHash,
+        }));
+      }
+    }
 
-        row.appendChild(left);
-        row.appendChild(right);
-        historyEl.appendChild(row);
+    /* ── Global echo log (durable, server-side) ───────────────── */
+    function globalRowTotalText(ev) {
+      // Server-side total round-trip = chain confirm ts − request chain ts.
+      if (ev.status === "confirmed" && ev.echoConfirmedTs != null && ev.requestTs != null) {
+        return fmtMs(Math.max(0, ev.echoConfirmedTs - ev.requestTs));
+      }
+      if (ev.status === "skipped" || ev.status === "failed") return "—";
+      return "…";
+    }
+
+    function renderGlobalLog() {
+      globalLogEl.innerHTML = "";
+      // De-dupe against the user's own attempts (those carry richer local
+      // timing); a global row whose requestTxId matches a local entry is
+      // suppressed so it isn't shown twice.
+      const localIds = new Set(history.map((h) => h.requestTxId).filter(Boolean));
+      const rows = globalLog.filter((ev) => !localIds.has(ev.requestTxId));
+      if (rows.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "No echoes recorded yet.";
+        globalLogEl.appendChild(empty);
+        return;
+      }
+      for (const ev of rows) {
+        const useEcho = ev.echoBlockHeight != null;
+        globalLogEl.appendChild(buildAttemptRow({
+          sentAmount: ev.requestAmount,
+          echoAmount: ev.echoAmount,
+          statusText: displayStatus(ev),
+          totalText: globalRowTotalText(ev),
+          blockLabel: useEcho ? "Echo" : "Request",
+          blockHeight: useEcho ? ev.echoBlockHeight : ev.requestBlockHeight,
+          blockHash: useEcho ? ev.echoBlockHash : ev.requestBlockHash,
+        }));
+      }
+    }
+
+    function renderDiagnostics(stats) {
+      if (!stats) { diagCard.style.display = "none"; return; }
+      diagCard.style.display = "block";
+      diagSuccess.textContent = stats.successRate != null
+        ? Math.round(stats.successRate * 100) + "%" : "—";
+      // Percentiles are noisy on tiny samples — require ≥10 confirmed events.
+      const enough = (stats.confirmed || 0) >= 10;
+      diagMedian.textContent = (enough && stats.medianTotalMs != null) ? fmtMs(stats.medianTotalMs) : "—";
+      diagP95.textContent = (enough && stats.p95TotalMs != null) ? fmtMs(stats.p95TotalMs) : "—";
+      const bits = [];
+      if (stats.total != null) bits.push(stats.total + " recent");
+      if (stats.confirmed != null) bits.push(stats.confirmed + " ok");
+      if (stats.failed) bits.push(stats.failed + " failed");
+      if (stats.skipped) bits.push(stats.skipped + " skipped");
+      if (stats.mode === "mock") bits.push("mock mode");
+      if (!enough) bits.push("latency needs ≥10 confirmed");
+      diagMeta.textContent = bits.join(" · ");
+    }
+
+    /* ── Success Rate Over Time chart ────────────────────────── */
+    let successRateChart = null;
+    let _successRateMeta = []; // parallel array to chart data slots (null = empty hour)
+
+    function initSuccessRateChart() {
+      const canvas = document.getElementById("successRateChart");
+      if (!canvas || !window.Chart) return null;
+      const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const barColor  = isDark ? "rgba(93,211,158,0.75)"    : "rgba(15,118,110,0.75)";
+      const gridColor = isDark ? "rgba(255,255,255,0.08)"   : "rgba(0,0,0,0.06)";
+      const tickColor = isDark ? "#a8b3c7"                  : "#4b5568";
+      return new window.Chart(canvas, {
+        type: "bar",
+        data: {
+          labels: [],
+          datasets: [{
+            data: [],
+            backgroundColor: barColor,
+            borderRadius: 4,
+            borderSkipped: false,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                label: (item) => {
+                  const b = _successRateMeta[item.dataIndex];
+                  if (!b) return "No data";
+                  return b.successRate.toFixed(1) + "% · " +
+                    b.confirmed + " ok / " + b.failed + " failed / " + b.skipped + " skipped";
+                },
+              },
+            },
+          },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: {
+                color: tickColor, font: { size: 11 }, maxRotation: 0,
+                maxTicksLimit: 8,
+              },
+            },
+            y: {
+              min: 0, max: 100,
+              ticks: {
+                stepSize: 25,
+                color: tickColor,
+                font: { size: 11 },
+                callback: (v) => v + "%",
+              },
+              grid: { color: gridColor },
+            },
+          },
+        },
+      });
+    }
+
+    function updateSuccessRateChart(buckets) {
+      const card   = document.getElementById("successRateCard");
+      const noData = document.getElementById("successRateNoData");
+      const wrap   = document.getElementById("successRateChartWrap");
+      if (!card) return;
+
+      card.style.display = "block";
+
+      if (!buckets || buckets.length === 0) {
+        if (noData) noData.style.display = "block";
+        if (wrap)   wrap.style.display   = "none";
+        return;
+      }
+
+      if (noData) noData.style.display = "none";
+      if (wrap)   wrap.style.display   = "block";
+
+      if (!successRateChart) {
+        successRateChart = initSuccessRateChart();
+        if (!successRateChart) return;
+      }
+
+      // Build the 24-slot grid (current UTC hour down to 23 hours ago).
+      const now = new Date();
+      now.setUTCMinutes(0, 0, 0);
+
+      const bucketMap = new Map();
+      for (const b of buckets) bucketMap.set(b.hourStart.slice(0, 13), b);
+
+      const labels = [];
+      const data   = [];
+      _successRateMeta = [];
+
+      for (let i = 23; i >= 0; i--) {
+        const slot = new Date(now.getTime() - i * 3_600_000);
+        const key  = slot.toISOString().slice(0, 13); // "YYYY-MM-DDTHH" (UTC)
+        // Label shows local hour so users see their own timezone.
+        labels.push(slot.getHours().toString().padStart(2, "0") + ":00");
+        const b = bucketMap.get(key) || null;
+        data.push(b ? b.successRate : null);
+        _successRateMeta.push(b);
+      }
+
+      successRateChart.data.labels            = labels;
+      successRateChart.data.datasets[0].data  = data;
+      successRateChart.update("none");
+    }
+
+    async function fetchSuccessRate() {
+      try {
+        const r = await fetch("/__echo/success-rate", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.buckets)) {
+          updateSuccessRateChart(data.buckets);
+        }
+      } catch (_) {}
+    }
+
+    async function fetchHistoryPage(before) {
+      const params = new URLSearchParams();
+      params.set("limit", String(GLOBAL_LOG_PAGE));
+      if (before) params.set("before", before);
+      const r = await fetch("/__echo/history?" + params.toString(), {
+        cache: "no-store",
+        headers: authHeaders(),
+      });
+      if (!r.ok) throw new Error("history " + r.status);
+      return r.json();
+    }
+
+    // Auto-refresh: re-fetch the newest page for liveness + stats, but keep
+    // any older pages the user pulled in via "Load more" (those are static).
+    async function refreshGlobalFirstPage() {
+      if (globalLoading) return;
+      globalLoading = true;
+      try {
+        const data = await fetchHistoryPage(null);
+        const fresh = Array.isArray(data.events) ? data.events : [];
+        const wasEmpty = globalLog.length === 0;
+        const freshIds = new Set(fresh.map((e) => e.requestTxId));
+        const tail = globalLog.filter((e) => !freshIds.has(e.requestTxId));
+        globalLog = fresh.concat(tail);
+        // Only seed the pagination cursor on the very first load; afterwards
+        // globalCursor tracks the end of the manually-loaded tail.
+        if (wasEmpty) globalCursor = data.nextCursor || null;
+        renderGlobalLog();
+        renderDiagnostics(data.stats);
+        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+      } catch (_) {
+        /* transient — next poll retries */
+      } finally {
+        globalLoading = false;
+      }
+    }
+
+    // "Load more": append the next older page; cursor advances. Static — the
+    // auto-refresh above won't drop what's appended here.
+    async function loadMoreGlobal() {
+      if (globalLoading || !globalCursor) return;
+      globalLoading = true;
+      if (loadMoreBtn) loadMoreBtn.disabled = true;
+      try {
+        const data = await fetchHistoryPage(globalCursor);
+        if (Array.isArray(data.events) && data.events.length) {
+          const seen = new Set(globalLog.map((e) => e.requestTxId));
+          for (const ev of data.events) if (!seen.has(ev.requestTxId)) globalLog.push(ev);
+        }
+        globalCursor = data.nextCursor || null;
+        renderGlobalLog();
+        renderDiagnostics(data.stats);
+        if (loadMoreBtn) loadMoreBtn.style.display = globalCursor ? "block" : "none";
+      } catch (_) {
+        /* ignore — user can retry */
+      } finally {
+        globalLoading = false;
+        if (loadMoreBtn) loadMoreBtn.disabled = false;
       }
     }
 
@@ -1299,7 +1930,10 @@
 
     /* ── Server state polling ─────────────────────────────── */
     async function pollServerState() {
-      if (pendingByTxId.size === 0) return;
+      // Fire when there are actively-tracked echoes OR when any "checking"
+      // entry (recovered from a page-reload) still needs its status resolved.
+      const hasCheckingEntry = history.some(h => h.status === "checking");
+      if (pendingByTxId.size === 0 && !hasCheckingEntry) return;
       let resp;
       try {
         const r = await fetch("/__echo/state", {
@@ -1324,7 +1958,41 @@
 
       for (const [txId, entry] of pendingByTxId) {
         const ev = byId.get(txId);
-        if (!ev) continue;
+        if (!ev) {
+          // "checking" entries not found on the server can't be recovered
+          // (either too old for the server's event window, or unresolvable).
+          if (entry.status === "checking") {
+            entry.status = "failed";
+            entry.error = entry.error || "Page reloaded before send confirmed";
+            pendingByTxId.delete(txId);
+            dirty = true;
+            if (history[0] === entry) latestUpdated = entry;
+          }
+          continue;
+        }
+
+        // "checking" entry found on the server: copy its real state.
+        if (entry.status === "checking") {
+          if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
+          if (entry.requestBlockHeight == null && typeof ev.requestBlockHeight === "number")
+            entry.requestBlockHeight = ev.requestBlockHeight;
+          if (!entry.requestBlockHash && typeof ev.requestBlockHash === "string")
+            entry.requestBlockHash = ev.requestBlockHash;
+          if (entry.echoBlockHeight == null && typeof ev.echoBlockHeight === "number")
+            entry.echoBlockHeight = ev.echoBlockHeight;
+          if (!entry.echoBlockHash && typeof ev.echoBlockHash === "string")
+            entry.echoBlockHash = ev.echoBlockHash;
+          entry.errorCategory = ev.errorCategory || null;
+          entry.nextRetryAtMs = ev.nextRetryAtMs != null ? ev.nextRetryAtMs : null;
+          if (ev.retryAttempts != null) entry.retryAttempts = ev.retryAttempts;
+          if (ev.error != null) entry.errorRaw = ev.error;
+          entry.status = ev.status;
+          const isTerminal = ev.status === "confirmed" || ev.status === "failed" || ev.status === "skipped";
+          if (isTerminal) pendingByTxId.delete(txId);
+          dirty = true;
+          if (history[0] === entry) latestUpdated = entry;
+          continue;
+        }
 
         if (ev.echoAmount != null) entry.echoAmount = ev.echoAmount;
         // Server-side block heights + hashes. requestBlock* is normally
@@ -1344,22 +2012,35 @@
           entry.echoBlockHash = ev.echoBlockHash;
         }
 
+        // Structured error / retry fields (server-classified).
+        if (ev.errorCategory !== undefined && entry.errorCategory !== ev.errorCategory) {
+          entry.errorCategory = ev.errorCategory || null;
+          dirty = true;
+        }
+        entry.nextRetryAtMs = ev.nextRetryAtMs != null ? ev.nextRetryAtMs : null;
+        if (ev.retryAttempts != null) entry.retryAttempts = ev.retryAttempts;
+        if (ev.error != null) entry.errorRaw = ev.error;
+
         if (ev.status === "skipped") {
           entry.status = "skipped";
           entry.error = ev.error || "Skipped by server";
+          entry.errorRaw = ev.error || entry.error;
+          entry.errorCategory = ev.errorCategory || "skip";
           pendingByTxId.delete(txId);
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
-          pbOutcome = { kind: "fail", txId, message: "Skipped: " + entry.error };
+          pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
           continue;
         }
         if (ev.status === "failed") {
           entry.status = "failed";
           entry.error = ev.error || "Echo send failed";
+          entry.errorRaw = ev.error || entry.error;
+          entry.errorCategory = ev.errorCategory || "permanent";
           pendingByTxId.delete(txId);
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
-          pbOutcome = { kind: "fail", txId, message: "Echo failed: " + entry.error };
+          pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
           continue;
         }
 
@@ -1383,8 +2064,27 @@
           pbOutcome = { kind: "ok", txId, totalMs: entry.totalLatencyMs };
         } else if (ev.status === "echoing" && entry.status !== "echoing") {
           entry.status = "echoing";
+          entry.errorCategory = null;
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
+        } else if (ev.status === "pending" && ev.retryAttempts > 0) {
+          // Transient retry in backoff — distinct from "waiting for echo".
+          if (entry.status !== "pending" || entry.errorCategory !== "transient") dirty = true;
+          entry.status = "pending";
+          entry.errorCategory = "transient";
+          if (history[0] === entry) latestUpdated = entry;
+          if (_pbTrackingTxId === txId) pbOutcome = { kind: "retry", txId, attempt: ev.retryAttempts };
+        }
+      }
+
+      // Resolve any "checking" entries that aren't in pendingByTxId (they have
+      // no requestTxId so they can't be matched against server events).
+      for (const h of history) {
+        if (h.status === "checking") {
+          h.status = "failed";
+          h.error = h.error || "Page reloaded before send confirmed";
+          dirty = true;
+          if (history[0] === h) latestUpdated = h;
         }
       }
 
@@ -1399,6 +2099,7 @@
       // newer attempt, so older confirmations harmlessly fall through here.
       if (pbOutcome && pbOutcome.txId === _pbTrackingTxId) {
         if (pbOutcome.kind === "ok") completeEchoPhaseProgressBar(pbOutcome.totalMs);
+        else if (pbOutcome.kind === "retry") retryPhaseProgressBar(pbOutcome.txId, pbOutcome.attempt);
         else failProgressBar(pbOutcome.message);
       }
     }
@@ -1408,6 +2109,8 @@
       loadHistory();
       renderHistory();
       if (history[0]) renderLatest(history[0]);
+
+      if (loadMoreBtn) loadMoreBtn.addEventListener("click", loadMoreGlobal);
 
       // If we were reloaded mid-echo, restore the progress bar so the user
       // gets the same persistent visual instead of looking at a frozen UI.
@@ -1456,13 +2159,49 @@
         } catch (_) {}
       }
 
+      // Max button: derive the user's available balance (client-side, via
+      // getTransactions — there is no balance API). In a staging container or
+      // local-dev mock mode, a ?demo=1 query injects a fixed demo balance so
+      // Max is demonstrable without a funded wallet. Strict no-op in
+      // production: ECHO_IS_STAGING is false and live mode is not mock, so the
+      // override never fires and the real on-chain derivation runs instead.
+      try {
+        const demoParam = new URLSearchParams(window.location.search).get("demo") === "1";
+        balanceDemo = demoParam && (ECHO_IS_STAGING || isMock);
+      } catch (_) { balanceDemo = false; }
+      if (maxBtn) maxBtn.addEventListener("click", onMaxClick);
+      refreshAvailableBalance(true);
+
       setInterval(pollServerState, STATE_POLL_MS);
       pollServerState();
+
+      // Global echo log + diagnostics: initial fetch, then slow auto-refresh
+      // of the newest page (loaded older pages stay put).
+      refreshGlobalFirstPage();
+      setInterval(refreshGlobalFirstPage, HISTORY_POLL_MS);
+
+      // Success-rate chart: same cadence as the history poll.
+      fetchSuccessRate();
+      setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
       // Health banner polls on its own slower cadence so it stays current
       // even when there are no pending echoes (pollServerState idles then).
       setInterval(pollHealth, 10000);
       pollHealth();
+
+      // 1-second countdown tick: updates the "Retrying in Xs…" line on the
+      // latest card between server polls so the countdown stays live.
+      // No HTTP call — pure display-layer math on nextRetryAtMs.
+      setInterval(() => {
+        const top = history[0];
+        if (!top || !top.nextRetryAtMs || displayStatus(top) !== "retrying") return;
+        const secs = Math.max(0, Math.round((top.nextRetryAtMs - Date.now()) / 1000));
+        const attPart = top.retryAttempts ? " (attempt " + top.retryAttempts + "/30)" : "";
+        latestRetryText.textContent = secs > 0
+          ? "Retrying in " + secs + "s…" + attPart
+          : "Retrying…" + attPart;
+        if (latestRetry.style.display !== "flex") latestRetry.style.display = "flex";
+      }, 1000);
     })();
   </script>
 </body>
