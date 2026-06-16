@@ -324,6 +324,63 @@
       padding-bottom: max(12px, env(safe-area-inset-bottom));
     }
     .footer-note .pubkey { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    /* Toast notifications */
+    @keyframes toast-in {
+      from { transform: translateX(110%); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+    #toastContainer {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+      z-index: 9999;
+      max-width: 320px;
+      width: calc(100vw - 24px);
+    }
+    .toast {
+      pointer-events: auto;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      font-size: 13px;
+      line-height: 1.4;
+      border-left: 3px solid transparent;
+      background: var(--card);
+      color: var(--fg);
+      animation: toast-in 200ms ease-out forwards;
+      transition: transform 200ms ease-in, opacity 200ms ease-in;
+      cursor: pointer;
+      word-break: break-word;
+    }
+    .toast-out {
+      transform: translateX(110%);
+      opacity: 0;
+    }
+    .toast-success { border-left-color: var(--ok);   background: rgba(15, 118, 110, 0.08); }
+    .toast-error   { border-left-color: var(--err);  background: rgba(200, 30, 30, 0.08); }
+    .toast-warn    { border-left-color: var(--warn); background: rgba(202, 138, 4, 0.08); }
+    .toast-msg { flex: 1 1 auto; }
+    .toast-close {
+      flex: 0 0 auto;
+      font-size: 15px;
+      line-height: 1;
+      color: var(--muted);
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .toast-close:hover { color: var(--fg); }
   </style>
 </head>
 <body>
@@ -720,6 +777,9 @@
     let sendGeneration = 0;
     let history = []; // [{ requestTxId, sentAmount, expectedEcho, sentAtMs, confirmedAtMs, echoSeenAtMs, status, error, server }]
     let pendingByTxId = new Map(); // requestTxId -> history entry
+    // Prevents the amber delay-warning toast from firing more than once per send.
+    // Reset at the start of each new send in startProgressBar().
+    let _delayToastFired = false;
 
     // Global echo log (durable, server-side). Accumulated across "Load more".
     let globalLog = [];            // array of server event rows
@@ -888,6 +948,7 @@
       }
       pbSetLabel("Sending…", "tx-progress-label", true);
       _pbSendStart = performance.now();
+      _delayToastFired = false;
       const tick = () => {
         if (_pbPhase !== "sending") return;
         const s = (performance.now() - _pbSendStart) / 1000;
@@ -899,8 +960,13 @@
           f.style.width = pbSendPercent(s) + "%";
         }
         if (s >= TX_PB_ERR_S)      pbSetLabel("Taking longer than it should", "tx-progress-label err", false);
-        else if (s >= TX_PB_WARN_S) pbSetLabel("Taking longer than expected", "tx-progress-label warn", true);
-        else                         pbSetLabel("Sending…", "tx-progress-label", true);
+        else if (s >= TX_PB_WARN_S) {
+          pbSetLabel("Taking longer than expected", "tx-progress-label warn", true);
+          if (!_delayToastFired) {
+            _delayToastFired = true;
+            showToast("warn", "Taking longer than expected — network may be congested", 10000);
+          }
+        } else                       pbSetLabel("Sending…", "tx-progress-label", true);
         _pbRaf = setTimeout(tick, PB_TICK_MS);
       };
       // First sample after one tick interval — the CSS transition kicks in
@@ -1028,6 +1094,53 @@
       errMsg.classList.add("err");
     }
     function clearError() { errMsg.style.display = "none"; }
+
+    // Truncate an error string to the first em-dash, first sentence-ending
+    // period, or 80 characters — whichever comes first — for use in toasts.
+    function shortError(msg) {
+      if (!msg) return "Unknown error";
+      const emDash = msg.indexOf("—");
+      const period = msg.indexOf(".");
+      let cut = 80;
+      if (emDash > 0) cut = Math.min(cut, emDash);
+      if (period > 0) cut = Math.min(cut, period + 1);
+      const s = msg.slice(0, cut).trimEnd();
+      return s.length < msg.length ? s + "…" : s;
+    }
+
+    function showToast(type, message, durationMs) {
+      const container = document.getElementById("toastContainer");
+      if (!container) return;
+
+      const toast = document.createElement("div");
+      toast.className = "toast toast-" + type;
+
+      const msgEl = document.createElement("span");
+      msgEl.className = "toast-msg";
+      msgEl.textContent = message;
+
+      const closeBtn = document.createElement("button");
+      closeBtn.className = "toast-close";
+      closeBtn.setAttribute("aria-label", "Dismiss");
+      closeBtn.textContent = "×";
+
+      toast.appendChild(msgEl);
+      toast.appendChild(closeBtn);
+      container.appendChild(toast);
+
+      let dismissed = false;
+      function dismiss() {
+        if (dismissed) return;
+        dismissed = true;
+        clearTimeout(timer);
+        toast.classList.add("toast-out");
+        setTimeout(() => toast.remove(), 250);
+        toast.addEventListener("transitionend", () => toast.remove(), { once: true });
+      }
+
+      toast.addEventListener("click", dismiss);
+      const timer = setTimeout(dismiss, durationMs);
+    }
 
     /* ── Available balance (powers the Max button) ─────────── */
     // There is no balance API on this stack — the bridge exposes only
@@ -1200,6 +1313,7 @@
         requestBlockHash: null,
         echoBlockHeight: null,
         echoBlockHash: null,
+        _errorToastFired: false,
       };
       history.unshift(entry);
       if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
@@ -1294,6 +1408,10 @@
         if (history[0] === entry) renderLatest(entry);
         renderHistory();
         showError(entry.error);
+        if (!entry._errorToastFired) {
+          entry._errorToastFired = true;
+          showToast("error", "Echo failed — " + shortError(entry.error), 8000);
+        }
         return;
       }
 
@@ -2030,6 +2148,10 @@
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
           pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
+          if (!entry._errorToastFired) {
+            entry._errorToastFired = true;
+            showToast("error", "Echo failed — " + shortError(entry.error), 8000);
+          }
           continue;
         }
         if (ev.status === "failed") {
@@ -2041,6 +2163,10 @@
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
           pbOutcome = { kind: "fail", txId, message: friendlyError(entry.error) };
+          if (!entry._errorToastFired) {
+            entry._errorToastFired = true;
+            showToast("error", "Echo failed — " + shortError(entry.error), 8000);
+          }
           continue;
         }
 
@@ -2062,6 +2188,9 @@
           dirty = true;
           if (history[0] === entry) latestUpdated = entry;
           pbOutcome = { kind: "ok", txId, totalMs: entry.totalLatencyMs };
+          const rttTxt = entry.totalLatencyMs != null
+            ? " — " + (entry.totalLatencyMs / 1000).toFixed(2) + "s round trip" : "";
+          showToast("success", "Echo received" + rttTxt, 5000);
         } else if (ev.status === "echoing" && entry.status !== "echoing") {
           entry.status = "echoing";
           entry.errorCategory = null;
@@ -2204,5 +2333,6 @@
       }, 1000);
     })();
   </script>
+  <div id="toastContainer" role="status" aria-live="polite"></div>
 </body>
 </html>
