@@ -168,8 +168,10 @@ function createEcho(opts) {
   }
   function setChainId(id) {
     if (id && id !== chainId) {
+      const isFirst = !chainId;
       chainId = id;
       console.log(`[echo] chain_id set: ${id}`);
+      if (isFirst && typeof store.seedStaging === "function") store.seedStaging(id).catch(() => {});
     }
   }
 

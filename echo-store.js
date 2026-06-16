@@ -515,11 +515,15 @@ function createEchoStore(opts = {}) {
     }
   }
 
-  // Insert synthetic echo_events rows so the success-rate chart has visible
-  // data in a fresh staging container. Idempotent within each calendar day
-  // (txIds include today's date). Only called when USERNODE_ENV=staging.
+  // IS_STAGING-gated seed: inserts demo rows for both the success-rate chart
+  // (hourly buckets, idempotent per calendar day) and the transaction history
+  // log (fixed rows with varied statuses). Called from echo-logic.js once the
+  // chain_id is known. Idempotent throughout — ON CONFLICT DO NOTHING.
   async function seedStaging(chainId) {
-    if (!isReady()) return;
+    const IS_STAGING = process.env.USERNODE_ENV === "staging";
+    if (!IS_STAGING || !isReady()) return;
+
+    // Hourly chart demo rows — success-rate buckets for the past 24h.
     try {
       const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
       const now   = new Date();
@@ -528,14 +532,12 @@ function createEchoStore(opts = {}) {
       let seeded = 0;
 
       for (let h = 23; h >= 0; h--) {
-        // Floor to the start of this UTC hour slot.
         const hourStart = Math.floor((now.getTime() - h * hourMs) / hourMs) * hourMs;
-        // Every 4th oldest hour has one failure so the chart shows some variation.
-        const hasFailure    = (h % 4 === 0);
+        const hasFailure     = (h % 4 === 0);
         const confirmedCount = hasFailure ? 6 : 7;
 
         for (let i = 0; i < confirmedCount; i++) {
-          const tsMs = hourStart + i * 8 * 60_000; // spread 8 min apart
+          const tsMs = hourStart + i * 8 * 60_000;
           const ts   = new Date(tsMs);
           const txId = `staging-chart-${today}-h${h}-c${i}`;
           const { rowCount } = await pool.query(
@@ -575,6 +577,93 @@ function createEchoStore(opts = {}) {
     } catch (e) {
       console.error("[echo-store] seedStaging error:", e.message);
     }
+
+    // Fixed demo log rows — varied entries for the transaction history view.
+    const BASE = 1749996000000; // 2026-06-15 16:00 UTC
+    const SENDER = "ut1demodemo000000000sender00000000aabbccddeeffgg";
+    const rows = [
+      // 5 confirmed rows with full timing + block data
+      [
+        "txreqdemo0000000001aabbccddeeffgghhjj", chainId, SENDER + "01",
+        5, 4, "confirmed", null, null, 0,
+        BASE, BASE + 1200, BASE + 2000,
+        "txechodemo000000001aabbccddeeffgghhjj",
+        BASE + 42000, BASE + 42800,
+        1001001, "bhdemo_req_0001aabbccddeeff", 1001003, "bhdemo_echo0001aabbccddeeff",
+      ],
+      [
+        "txreqdemo0000000002aabbccddeeffgghhjj", chainId, SENDER + "02",
+        10, 9, "confirmed", null, null, 0,
+        BASE + 120000, BASE + 121300, BASE + 122000,
+        "txechodemo000000002aabbccddeeffgghhjj",
+        BASE + 165000, BASE + 165900,
+        1001010, "bhdemo_req_0002aabbccddeeff", 1001012, "bhdemo_echo0002aabbccddeeff",
+      ],
+      [
+        "txreqdemo0000000003aabbccddeeffgghhjj", chainId, SENDER + "03",
+        2, 1, "confirmed", null, null, 0,
+        BASE + 240000, BASE + 241100, BASE + 241800,
+        "txechodemo000000003aabbccddeeffgghhjj",
+        BASE + 290000, BASE + 290700,
+        1001020, "bhdemo_req_0003aabbccddeeff", 1001022, "bhdemo_echo0003aabbccddeeff",
+      ],
+      [
+        "txreqdemo0000000004aabbccddeeffgghhjj", chainId, SENDER + "04",
+        20, 19, "confirmed", null, null, 0,
+        BASE + 360000, BASE + 361400, BASE + 362100,
+        "txechodemo000000004aabbccddeeffgghhjj",
+        BASE + 398000, BASE + 398600,
+        1001030, "bhdemo_req_0004aabbccddeeff", 1001032, "bhdemo_echo0004aabbccddeeff",
+      ],
+      [
+        "txreqdemo0000000005aabbccddeeffgghhjj", chainId, SENDER + "05",
+        3, 2, "confirmed", null, null, 0,
+        BASE + 480000, BASE + 481200, BASE + 481900,
+        "txechodemo000000005aabbccddeeffgghhjj",
+        BASE + 533000, BASE + 533700,
+        1001040, "bhdemo_req_0005aabbccddeeff", 1001042, "bhdemo_echo0005aabbccddeeff",
+      ],
+      // 1 failed row (permanent — too many retries)
+      [
+        "txreqdemo0000000006aabbccddeeffgghhjj", chainId, SENDER + "06",
+        5, null, "failed",
+        "Echo send failed: gave up after 30 retries", "permanent", 30,
+        BASE + 600000, BASE + 601000, null,
+        null, null, null,
+        1001050, "bhdemo_req_0006aabbccddeeff", null, null,
+      ],
+      // 1 skipped row (amount < 2)
+      [
+        "txreqdemo0000000007aabbccddeeffgghhjj", chainId, SENDER + "07",
+        1, null, "skipped",
+        "Amount must be ≥ 2 — the echo returns N-1, so 1 or less leaves nothing to send back.",
+        "skip", 0,
+        BASE + 720000, BASE + 720500, null,
+        null, null, null,
+        1001060, "bhdemo_req_0007aabbccddeeff", null, null,
+      ],
+      // 1 pending row (echo not yet confirmed)
+      [
+        "txreqdemo0000000008aabbccddeeffgghhjj", chainId, SENDER + "08",
+        7, null, "pending", null, null, 0,
+        BASE + 840000, BASE + 841100, null,
+        null, null, null,
+        1001070, "bhdemo_req_0008aabbccddeeff", null, null,
+      ],
+    ];
+    const colList = COLS.join(", ");
+    const placeholders = COLS.map((_, i) => "$" + (i + 1)).join(", ");
+    const sql = `INSERT INTO echo_events (${colList}) VALUES (${placeholders}) ON CONFLICT (request_tx_id) DO NOTHING`;
+    let seeded = 0;
+    for (const params of rows) {
+      try {
+        const r = await pool.query(sql, params);
+        seeded += r.rowCount || 0;
+      } catch (e) {
+        console.warn("[echo-store] staging seed row failed:", e.message);
+      }
+    }
+    if (seeded > 0) console.log(`[echo-store] seeded ${seeded} staging demo rows (chain=${chainId})`);
   }
 
   async function close() {
