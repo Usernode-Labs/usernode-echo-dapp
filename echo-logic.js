@@ -147,7 +147,8 @@ function createEcho(opts) {
   const appPubkey = opts.appPubkey || "ut1_echo_default_pubkey";
   const appSecretKey = opts.appSecretKey || "";
   const nodeRpcUrl = opts.nodeRpcUrl || "http://localhost:3000";
-  const localDev = !!opts.localDev;
+  const localDev  = !!opts.localDev;
+  const isStaging = !!opts.isStaging;
   const mockTransactions = opts.mockTransactions || null;
 
   // Durable write-through mirror of the in-memory `events` Map. Disabled
@@ -1025,6 +1026,53 @@ function createEcho(opts) {
     });
   }
 
+  // In-memory fallback when the DB is not ready.
+  function computeSuccessRateFromMemory(windowHours) {
+    const cutoff  = Date.now() - windowHours * 3_600_000;
+    const buckets = new Map();
+    for (const ev of events.values()) {
+      if (!["confirmed", "failed", "skipped"].includes(ev.status)) continue;
+      const ts = ev.requestSeenAtServerMs || ev.requestTs;
+      if (!ts || ts < cutoff) continue;
+      const hourMs = Math.floor(ts / 3_600_000) * 3_600_000;
+      if (!buckets.has(hourMs)) buckets.set(hourMs, { confirmed: 0, failed: 0, skipped: 0 });
+      const b = buckets.get(hourMs);
+      b[ev.status]++;
+    }
+    return Array.from(buckets.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([hourMs, b]) => {
+        const total = b.confirmed + b.failed + b.skipped;
+        return {
+          hourStart: new Date(hourMs).toISOString(),
+          confirmed: b.confirmed,
+          failed: b.failed,
+          skipped: b.skipped,
+          total,
+          successRate: total > 0 ? Math.round((b.confirmed / total) * 1000) / 10 : null,
+        };
+      });
+  }
+
+  async function handleSuccessRate(req, res) {
+    let windowHours = 24;
+    try {
+      const u = new URL(req.url, "http://x");
+      const w = parseInt(u.searchParams.get("window"), 10);
+      if (Number.isFinite(w)) windowHours = Math.max(1, Math.min(168, w));
+    } catch (_) {}
+
+    let buckets;
+    if (store.isReady()) {
+      buckets = await store.getSuccessRateBuckets(effectiveChainId(), windowHours);
+      if (!buckets) buckets = computeSuccessRateFromMemory(windowHours);
+    } else {
+      buckets = computeSuccessRateFromMemory(windowHours);
+    }
+
+    sendJson(req, res, { buckets, windowHours });
+  }
+
   function handleRequest(req, res, pathname) {
     if (pathname === "/__echo/my-stats" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") {
@@ -1053,6 +1101,16 @@ function createEcho(opts) {
     }
     if (pathname === "/__echo/state" && (req.method === "GET" || req.method === "HEAD")) {
       sendJson(req, res, getStateResponse());
+      return true;
+    }
+    if (pathname === "/__echo/success-rate" && (req.method === "GET" || req.method === "HEAD")) {
+      handleSuccessRate(req, res).catch((e) => {
+        console.error("[echo] success-rate error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "success-rate unavailable" }));
+        }
+      });
       return true;
     }
     if (pathname === "/__echo/history" && (req.method === "GET" || req.method === "HEAD")) {
@@ -1128,6 +1186,14 @@ function createEcho(opts) {
         trimEvents();
       } catch (e) {
         console.error("[echo] hydrate failed:", e.message);
+      }
+
+      // Staging: seed synthetic echo_events so the success-rate chart has
+      // visible data in a fresh container. Fire-and-forget — doesn't block boot.
+      if (isStaging) {
+        store.seedStaging(effectiveChainId()).catch((e) => {
+          console.error("[echo] staging seed error:", e.message);
+        });
       }
     })();
 
