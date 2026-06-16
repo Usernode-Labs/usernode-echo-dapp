@@ -87,6 +87,70 @@ test("queryUserStats is a no-op (null) without an address", async () => {
   assert.equal(await store.queryUserStats("chainA", "", 1000), null);
 });
 
+test("recordIdentity caches the username and upserts echo_identities", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+
+  store.recordIdentity("ut1alice", "alice");
+  // Allow the fire-and-forget promise chain to flush.
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(store.lookupIdentity("ut1alice"), "alice");
+  const idIns = pool.calls.queries.find((q) => /INSERT INTO echo_identities/i.test(q.sql));
+  assert.ok(idIns, "expected an echo_identities upsert");
+  assert.deepEqual(idIns.params, ["ut1alice", "alice"]);
+  const backfill = pool.calls.queries.find((q) => /UPDATE echo_events SET username/i.test(q.sql));
+  assert.ok(backfill, "expected an echo_events backfill update");
+});
+
+test("recordIdentity skips the DB write when the username is unchanged", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+
+  store.recordIdentity("ut1bob", "bob");
+  await new Promise((r) => setImmediate(r));
+  const before = pool.calls.queries.filter((q) => /echo_identities/i.test(q.sql)).length;
+
+  store.recordIdentity("ut1bob", "bob"); // same value → no new DB call
+  await new Promise((r) => setImmediate(r));
+  const after = pool.calls.queries.filter((q) => /echo_identities/i.test(q.sql)).length;
+
+  assert.equal(before, after);
+});
+
+test("recordIdentity ignores blank addresses and usernames", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+  store.recordIdentity("", "alice");
+  store.recordIdentity("ut1x", "  ");
+  store.recordIdentity("ut1x", null);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(store.lookupIdentity("ut1x"), null);
+  assert.equal(pool.calls.queries.some((q) => /INSERT INTO echo_identities/i.test(q.sql)), false);
+});
+
+test("persist stamps the cached username onto the echo_events row", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+  store.recordIdentity("ut1carol", "carol");
+  await new Promise((r) => setImmediate(r));
+
+  store.persist(
+    { requestTxId: "tx1", requestFrom: "ut1carol", requestAmount: 10, status: "confirmed" },
+    "chainA"
+  );
+  await new Promise((r) => setImmediate(r));
+
+  const upsert = pool.calls.inserts.find((p) => p[0] === "tx1");
+  assert.ok(upsert, "expected the event upsert");
+  // username is the last positional param (COLS appends it after echo_block_hash).
+  assert.equal(upsert[upsert.length - 1], "carol");
+});
+
 test("seedStagingDemo inserts the demo mix when staging + empty", async () => {
   const pool = makeFakePool({ existsRowCount: 0 });
   const store = createEchoStore({ pool, databaseUrl: "x", isStaging: true });

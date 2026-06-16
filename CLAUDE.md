@@ -41,11 +41,17 @@ npm start            # production mode (requires .env)
 
 ## Auth model
 
-Echo is **public**. There is no JWT, no platform login required, no
-`req.user` consulted anywhere. The `JWT_SECRET` env var is no longer used
-and `jsonwebtoken` is not a dependency. Wallet operations are signed
-client-side via `usernode-bridge.js`, which has three modes and picks one
-automatically:
+Echo is **public**. There is no JWT *gate* — no endpoint requires a login,
+and a missing/invalid token never blocks a request. We do, however, do a
+**non-gating** identity capture: `server.js` verifies the platform session
+JWT (HS256, with `JWT_SECRET`, using the built-in `crypto` module — so
+`jsonwebtoken` is still not a dependency) when a token is present and sets
+`req.user`. Echo uses this only to record each sender's Usernode username
+(`req.user.username` keyed by `usernode_pubkey`) so the leaderboard shows
+real usernames instead of `user_…` id fallbacks (see `echo_identities` in
+`echo-store.js`). No request is ever rejected for lacking a token. Wallet
+operations are still signed client-side via `usernode-bridge.js`, which has
+three modes and picks one automatically:
 
 - **Native (top frame in Flutter WebView)** — the Usernode mobile app
   injects a `Usernode` JS channel on every loaded page (see

@@ -54,12 +54,26 @@ CREATE TABLE IF NOT EXISTS echo_events (
   request_block_hash       TEXT,
   echo_block_height        BIGINT,
   echo_block_hash          TEXT,
+  username                 TEXT,
   created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Older prod tables predate the username column; add it idempotently.
+ALTER TABLE echo_events ADD COLUMN IF NOT EXISTS username TEXT;
 CREATE INDEX IF NOT EXISTS echo_events_created_at_idx ON echo_events (created_at DESC);
 CREATE INDEX IF NOT EXISTS echo_events_chain_created_idx ON echo_events (chain_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS echo_events_chain_from_idx ON echo_events (chain_id, request_from);
+
+-- Current-username-per-sender map. Captured from req.user when an
+-- authenticated viewer hits an /__echo/* endpoint (see recordIdentity).
+-- PUBLIC: usernames are global, on-chain-public identifiers — no
+-- 'staging:private' comment. The leaderboard joins this so a sender's
+-- latest username displays even for echoes recorded before we knew it.
+CREATE TABLE IF NOT EXISTS echo_identities (
+  address      TEXT PRIMARY KEY,
+  username     TEXT NOT NULL,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -83,6 +97,7 @@ const COLS = [
   "request_block_hash",
   "echo_block_height",
   "echo_block_hash",
+  "username",
 ];
 
 // `confirmed` is the success terminal — once a row is confirmed, a later
@@ -110,6 +125,7 @@ ON CONFLICT (request_tx_id) DO UPDATE SET
   request_block_hash   = COALESCE(EXCLUDED.request_block_hash, echo_events.request_block_hash),
   echo_block_height    = COALESCE(EXCLUDED.echo_block_height, echo_events.echo_block_height),
   echo_block_hash      = COALESCE(EXCLUDED.echo_block_hash, echo_events.echo_block_hash),
+  username             = COALESCE(EXCLUDED.username, echo_events.username),
   updated_at           = now()
 `;
 
@@ -144,10 +160,11 @@ function rowToEvent(row) {
     requestBlockHash: row.request_block_hash || null,
     echoBlockHeight: numOrNull(row.echo_block_height),
     echoBlockHash: row.echo_block_hash || null,
+    username: row.username || null,
   };
 }
 
-function eventToParams(ev, chainId) {
+function eventToParams(ev, chainId, username) {
   return [
     ev.requestTxId,
     chainId || null,
@@ -168,6 +185,7 @@ function eventToParams(ev, chainId) {
     ev.requestBlockHash || null,
     ev.echoBlockHeight != null ? Math.trunc(ev.echoBlockHeight) : null,
     ev.echoBlockHash || null,
+    username != null ? username : (ev.username || null),
   ];
 }
 
@@ -202,6 +220,15 @@ function createEchoStore(opts = {}) {
   let ready = false;
   let disabled = injectedPool ? false : (!databaseUrl || !Pool);
   let pruneTimer = null;
+
+  // address -> latest known Usernode username, captured from req.user. Lives
+  // in memory regardless of DB readiness so the in-memory leaderboard fallback
+  // can also resolve names. The DB row in echo_identities is the durable copy.
+  const identityCache = new Map();
+
+  function lookupIdentity(address) {
+    return address ? (identityCache.get(address) || null) : null;
+  }
 
   function isReady() {
     return ready && !disabled;
@@ -239,9 +266,44 @@ function createEchoStore(opts = {}) {
   // must not perturb the in-memory state machine.
   function persist(ev, chainId) {
     if (!isReady() || !ev || !ev.requestTxId || !ev.requestFrom) return;
+    // Stamp the row with the sender's known username so new scores persist it
+    // going forward. COALESCE in the UPSERT keeps any existing name when this
+    // is null (we may not have seen the sender authenticate yet).
+    const username = lookupIdentity(ev.requestFrom);
     pool
-      .query(UPSERT_SQL, eventToParams(ev, chainId))
+      .query(UPSERT_SQL, eventToParams(ev, chainId, username))
       .catch((e) => console.error("[echo-store] persist error:", e.message));
+  }
+
+  // Capture a sender's Usernode username (from req.user). Updates the
+  // in-memory cache always; when the DB is live, upserts echo_identities and
+  // backfills echo_events.username for that sender's prior rows so the
+  // leaderboard shows the name immediately. No-ops on unchanged values to
+  // avoid hammering the DB on every authenticated poll.
+  function recordIdentity(address, username) {
+    if (!address || !username || typeof username !== "string") return;
+    const trimmed = username.trim();
+    if (!trimmed) return;
+    if (identityCache.get(address) === trimmed) return; // unchanged — skip DB
+    identityCache.set(address, trimmed);
+    if (!isReady()) return;
+    pool
+      .query(
+        `INSERT INTO echo_identities (address, username, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (address) DO UPDATE
+           SET username = EXCLUDED.username, updated_at = now()
+           WHERE echo_identities.username IS DISTINCT FROM EXCLUDED.username`,
+        [address, trimmed]
+      )
+      .then(() =>
+        pool.query(
+          `UPDATE echo_events SET username = $2, updated_at = now()
+           WHERE request_from = $1 AND username IS DISTINCT FROM $2`,
+          [address, trimmed]
+        )
+      )
+      .catch((e) => console.error("[echo-store] recordIdentity error:", e.message));
   }
 
   // Boot hydration: most-recent rows for the current chain, newest first,
@@ -451,6 +513,25 @@ function createEchoStore(opts = {}) {
         [txId, chainId || null, sender, amt, echoAmt, reqTs, echoTs]
       );
     }
+
+    // Identities for the demo senders so the leaderboard renders Usernode
+    // usernames instead of raw ids. `staging-demo-epsilon` is intentionally
+    // omitted so the raw-id fallback is also visible in the preview.
+    const identities = [
+      ["staging-demo-alpha", "Staging Demo Alice"],
+      ["staging-demo-beta",  "Staging Demo Bob"],
+      ["staging-demo-gamma", "Staging Demo Carol"],
+      ["staging-demo-delta", "Staging Demo Dave"],
+    ];
+    for (const [address, username] of identities) {
+      identityCache.set(address, username);
+      await pool.query(
+        `INSERT INTO echo_identities (address, username, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (address) DO NOTHING`,
+        [address, username]
+      );
+    }
     console.log("[echo-store] staging leaderboard seed applied");
   }
 
@@ -611,16 +692,20 @@ function createEchoStore(opts = {}) {
     const lim = Math.max(1, Math.min(100, limit || 20));
     const sql = `
       SELECT
-        request_from AS address,
-        SUM(request_amount) FILTER (WHERE status = 'confirmed')::bigint AS tokens_sent,
-        COUNT(*) FILTER (WHERE status = 'confirmed')::int AS echo_count,
-        AVG(GREATEST(echo_confirmed_ts - request_ts, 0))
-          FILTER (WHERE status = 'confirmed' AND echo_confirmed_ts IS NOT NULL AND request_ts IS NOT NULL)
-          AS avg_latency_ms
-      FROM echo_events
-      WHERE chain_id IS NOT DISTINCT FROM $1
-      GROUP BY request_from
-      HAVING COUNT(*) FILTER (WHERE status = 'confirmed') > 0
+        e.request_from AS address,
+        SUM(e.request_amount) FILTER (WHERE e.status = 'confirmed')::bigint AS tokens_sent,
+        COUNT(*) FILTER (WHERE e.status = 'confirmed')::int AS echo_count,
+        AVG(GREATEST(e.echo_confirmed_ts - e.request_ts, 0))
+          FILTER (WHERE e.status = 'confirmed' AND e.echo_confirmed_ts IS NOT NULL AND e.request_ts IS NOT NULL)
+          AS avg_latency_ms,
+        -- Prefer the live identity map; fall back to a username stamped on a
+        -- past event. NULL when we've never seen this sender authenticate.
+        COALESCE(id.username, MAX(e.username)) AS username
+      FROM echo_events e
+      LEFT JOIN echo_identities id ON id.address = e.request_from
+      WHERE e.chain_id IS NOT DISTINCT FROM $1
+      GROUP BY e.request_from, id.username
+      HAVING COUNT(*) FILTER (WHERE e.status = 'confirmed') > 0
       ORDER BY tokens_sent DESC
       LIMIT $2
     `;
@@ -631,6 +716,7 @@ function createEchoStore(opts = {}) {
         tokensSent: numOrNull(row.tokens_sent) || 0,
         echoCount: row.echo_count || 0,
         avgLatencyMs: numOrNull(row.avg_latency_ms),
+        username: row.username || null,
       }));
     } catch (e) {
       console.error("[echo-store] queryLeaderboard error:", e.message);
@@ -862,6 +948,7 @@ function createEchoStore(opts = {}) {
   return { init, isReady, persist, hydrate, queryHistory, queryStats,
            getLeaderboard, queryUserStats, queryUserLatencyHistory,
            getSuccessRateBuckets, queryLeaderboard,
+           recordIdentity, lookupIdentity,
            seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
 }
 
