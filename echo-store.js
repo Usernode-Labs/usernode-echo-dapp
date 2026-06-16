@@ -390,6 +390,35 @@ function createEchoStore(opts = {}) {
     };
   }
 
+  // Per-user latency history: most recent `limit` confirmed echoes for a single
+  // sender, in chronological order (oldest first). Returns null when disabled.
+  async function queryUserLatencyHistory(chainId, address, limit) {
+    if (!isReady() || !address) return null;
+    const lim = Math.max(1, Math.min(200, limit || 50));
+    const sql = `
+      SELECT request_ts, echo_confirmed_ts
+      FROM echo_events
+      WHERE chain_id IS NOT DISTINCT FROM $1
+        AND request_from = $2
+        AND status = 'confirmed'
+        AND echo_confirmed_ts IS NOT NULL
+        AND request_ts IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT $3
+    `;
+    try {
+      const r = await pool.query(sql, [chainId || null, address, lim]);
+      // Reverse to chronological order (oldest first) for direct sparkline plotting.
+      return r.rows.reverse().map((row) => ({
+        ts: numOrNull(row.request_ts),
+        latencyMs: Math.max(0, numOrNull(row.echo_confirmed_ts) - numOrNull(row.request_ts)),
+      }));
+    } catch (e) {
+      console.error("[echo-store] queryUserLatencyHistory error:", e.message);
+      return null;
+    }
+  }
+
   // Boot-time staging seed: inserts confirmed echo events for 5 distinct fake
   // senders so the leaderboard renders with multiple rows in a fresh staging
   // container. Idempotent via ON CONFLICT DO NOTHING.
@@ -828,7 +857,8 @@ function createEchoStore(opts = {}) {
   }
 
   return { init, isReady, persist, hydrate, queryHistory, queryStats,
-           getLeaderboard, queryUserStats, getSuccessRateBuckets, queryLeaderboard,
+           getLeaderboard, queryUserStats, queryUserLatencyHistory,
+           getSuccessRateBuckets, queryLeaderboard,
            seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
 }
 
