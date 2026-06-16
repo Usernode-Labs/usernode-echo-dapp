@@ -165,6 +165,19 @@
     .max-btn:hover { border-color: var(--accent); }
     .max-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .max-btn.loading { color: var(--muted); }
+    .preset-row {
+      display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 10px;
+    }
+    .preset-btn {
+      padding: 4px 12px;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--accent); border-radius: 999px;
+      cursor: pointer; line-height: 1.4;
+      transition: background-color 0.12s ease;
+    }
+    .preset-btn:hover:not(:disabled) { background: rgba(124, 58, 237, 0.12); }
+    .preset-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .hint {
       font-size: 12px; color: var(--muted); margin-top: 8px;
     }
@@ -385,7 +398,7 @@
       text-decoration: none; line-height: 1.5;
     }
     .block-chip:hover, .block-chip:focus { text-decoration: underline; }
-    .block-chip .arrow { font-size: 10px; opacity: 0.7; }
+    .block-chip .arrow { width: 10px; height: 10px; opacity: 0.7; vertical-align: middle; margin-left: 2px; flex-shrink: 0; }
     .block-chip-label { font-size: 10px; color: var(--muted); margin-right: 2px; }
 
     /* Leaderboard table */
@@ -395,13 +408,15 @@
       padding: 0 6px 8px; text-transform: uppercase; letter-spacing: 0.4px;
     }
     .leaderboard-table th.lb-amount,
-    .leaderboard-table th.lb-count { text-align: right; }
+    .leaderboard-table th.lb-count,
+    .leaderboard-table th.lb-latency { text-align: right; }
     .leaderboard-table tbody tr { border-top: 1px solid var(--border); }
     .leaderboard-table td { padding: 8px 6px; }
     .lb-rank { color: var(--muted); width: 24px; font-variant-numeric: tabular-nums; }
     .lb-user { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .lb-amount { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .lb-count { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .leaderboard-table .lb-latency { text-align: right; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
     .info p { margin: 0 0 8px; font-size: 13px; color: var(--muted); line-height: 1.5; }
     .info code { background: var(--border); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
@@ -409,7 +424,7 @@
     /* Leaderboard card */
     .lb-row {
       display: grid;
-      grid-template-columns: 28px 1fr auto auto;
+      grid-template-columns: 28px 1fr auto auto auto;
       align-items: center;
       gap: 8px;
       padding: 7px 4px;
@@ -431,6 +446,7 @@
     .lb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
@@ -521,6 +537,12 @@
       <div class="card">
         <h2>Send</h2>
         <label for="amountInput">Amount (≥ 2)</label>
+        <div class="preset-row">
+          <button type="button" class="preset-btn" data-amount="2">2</button>
+          <button type="button" class="preset-btn" data-amount="5">5</button>
+          <button type="button" class="preset-btn" data-amount="10">10</button>
+          <button type="button" class="preset-btn" data-amount="50">50</button>
+        </div>
         <div class="row">
           <div class="amount-wrap">
             <input id="amountInput" type="number" min="2" step="1" value="2" inputmode="numeric" />
@@ -707,10 +729,11 @@
               <th>User</th>
               <th class="lb-amount">Total sent</th>
               <th class="lb-count">Echoes</th>
+              <th class="lb-latency">Avg latency</th>
             </tr>
           </thead>
           <tbody id="leaderboardBody">
-            <tr><td colspan="4" class="history-empty">Loading…</td></tr>
+            <tr><td colspan="5" class="history-empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -934,9 +957,27 @@
       node.appendChild(lbl);
       node.appendChild(text);
       if (useLink) {
-        const arrow = document.createElement("span");
-        arrow.className = "arrow";
-        arrow.textContent = "↗";
+        const arrow = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        arrow.setAttribute("class", "arrow");
+        arrow.setAttribute("viewBox", "0 0 24 24");
+        arrow.setAttribute("fill", "none");
+        arrow.setAttribute("stroke", "currentColor");
+        arrow.setAttribute("stroke-width", "2");
+        arrow.setAttribute("stroke-linecap", "round");
+        arrow.setAttribute("stroke-linejoin", "round");
+        arrow.setAttribute("aria-hidden", "true");
+        // Box (partial — left, bottom, right sides + top-left corner)
+        const boxPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        boxPath.setAttribute("d", "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6");
+        arrow.appendChild(boxPath);
+        // Top-right bracket (corner of arrow origin)
+        const bracketPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        bracketPath.setAttribute("d", "M15 3h6v6");
+        arrow.appendChild(bracketPath);
+        // Diagonal arrow line
+        const linePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        linePath.setAttribute("d", "M10 14L21 3");
+        arrow.appendChild(linePath);
         node.appendChild(arrow);
       }
       return node;
@@ -1164,6 +1205,27 @@
     const sendBtnLabel = document.getElementById("sendBtnLabel");
     const maxBtn = document.getElementById("maxBtn");
     const maxHint = document.getElementById("maxHint");
+    const presetBtns = Array.from(document.querySelectorAll(".preset-btn"));
+
+    /* ── Amount pre-fill from localStorage ───────────────────── */
+    try {
+      const saved = window.localStorage.getItem("echo:last_amount");
+      if (saved != null) {
+        const n = parseInt(saved, 10);
+        if (Number.isFinite(n) && n >= 2) amountInput.value = String(n);
+      }
+    } catch (_) {}
+
+    /* ── Preset button click handler ─────────────────────────── */
+    presetBtns.forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (sending) return;
+        const n = parseInt(btn.dataset.amount, 10);
+        amountInput.value = String(n);
+        clearError();
+        amountInput.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    });
     const errMsg = document.getElementById("errMsg");
     const modePill = document.getElementById("modePill");
     const appPubkeyText = document.getElementById("appPubkeyText");
@@ -1535,6 +1597,7 @@
       sendBtn.setAttribute("aria-busy", v ? "true" : "false");
       if (sendBtnLabel) sendBtnLabel.textContent = v ? "Sending…" : "Send";
       if (maxBtn) maxBtn.disabled = !!v;
+      presetBtns.forEach(b => { b.disabled = !!v; });
       if (v) {
         // Starting a fresh send always resets the bar — even if a previous
         // echo is still pending. The previous entry's eventual confirmation
@@ -1601,6 +1664,20 @@
 
       toast.addEventListener("click", dismiss);
       const timer = setTimeout(dismiss, durationMs);
+    }
+
+    /* ── Browser notifications ──────────────────────────────── */
+    function requestNotificationPermission() {
+      if (!("Notification" in window) || Notification.permission !== "default") return;
+      Notification.requestPermission();
+    }
+
+    function fireEchoNotification(totalMs) {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const opts = {};
+      if (totalMs != null) opts.body = "Round trip: " + (totalMs / 1000).toFixed(2) + "s";
+      const n = new Notification("Echo received", opts);
+      n.onclick = () => { window.focus(); n.close(); };
     }
 
     /* ── Available balance (powers the Max button) ─────────── */
@@ -1737,6 +1814,8 @@
         return;
       }
 
+      try { window.localStorage.setItem("echo:last_amount", String(amount)); } catch (_) {}
+
       const memo = JSON.stringify({ app: APP_ID, type: "send" });
 
       // Insert the entry up-front in "sending" status so the Latest
@@ -1816,6 +1895,8 @@
       };
       const timeoutPromise = new Promise((_, reject) => { timeoutReject = reject; });
       armSendTimeout(SEND_TIMEOUT_BACKSTOP_MS);
+
+      requestNotificationPermission();
 
       let result = null;
       try {
@@ -2267,15 +2348,19 @@
     }
 
     /* ── Leaderboard ──────────────────────────────────────── */
+    function fmtLatency(ms) {
+      if (ms == null || !Number.isFinite(ms)) return "—";
+      return (ms / 1000).toFixed(1) + "s";
+    }
+
     function renderLeaderboard() {
       const tbody = document.getElementById("leaderboardBody");
       if (!tbody) return;
       tbody.innerHTML = "";
       if (leaderboard === null) {
-        // Still loading — keep the placeholder row set in HTML.
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "Loading…";
         tr.appendChild(td);
@@ -2285,7 +2370,7 @@
       if (leaderboard === false) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "Couldn't load leaderboard.";
         tr.appendChild(td);
@@ -2295,7 +2380,7 @@
       if (leaderboard.length === 0) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 5;
         td.className = "history-empty";
         td.textContent = "No confirmed echoes yet.";
         tr.appendChild(td);
@@ -2304,14 +2389,15 @@
       }
       leaderboard.forEach(function (entry, i) {
         const displayName = (window.UsernameUsernames && window.UsernameUsernames.getUsernameSync)
-          ? window.UsernameUsernames.getUsernameSync(entry.sender)
-          : entry.sender.slice(-6);
+          ? window.UsernameUsernames.getUsernameSync(entry.address)
+          : entry.address.slice(-6);
         const tr = document.createElement("tr");
         const cells = [
-          { cls: "lb-rank",   text: String(i + 1) },
-          { cls: "lb-user",   text: displayName },
-          { cls: "lb-amount", text: Number(entry.totalSent).toLocaleString() },
-          { cls: "lb-count",  text: String(entry.echoCount) },
+          { cls: "lb-rank",    text: String(i + 1) },
+          { cls: "lb-user",    text: displayName },
+          { cls: "lb-amount",  text: Number(entry.tokensSent).toLocaleString() },
+          { cls: "lb-count",   text: String(entry.echoCount) },
+          { cls: "lb-latency", text: fmtLatency(entry.avgLatencyMs) },
         ];
         cells.forEach(function (c) {
           const td = document.createElement("td");
@@ -2463,10 +2549,15 @@
         echoesEl.className = "lb-echoes";
         echoesEl.textContent = entry.echoCount + "×";
 
+        const latencyEl = document.createElement("div");
+        latencyEl.className = "lb-latency";
+        latencyEl.textContent = fmtLatency(entry.avgLatencyMs);
+
         row.appendChild(rankEl);
         row.appendChild(nameEl);
         row.appendChild(tokensEl);
         row.appendChild(echoesEl);
+        row.appendChild(latencyEl);
         el.appendChild(row);
       });
     }
@@ -3246,6 +3337,7 @@
           const rttTxt = entry.totalLatencyMs != null
             ? " — " + (entry.totalLatencyMs / 1000).toFixed(2) + "s round trip" : "";
           showToast("success", "Echo received" + rttTxt, 5000);
+          fireEchoNotification(entry.totalLatencyMs);
         } else if (ev.status === "echoing" && entry.status !== "echoing") {
           entry.status = "echoing";
           entry.errorCategory = null;
