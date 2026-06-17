@@ -457,6 +457,66 @@
     .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .lb-best-time { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
+    .lb-verified { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .lb-verified a { color: var(--accent-text); text-decoration: none; }
+    .lb-verified a:hover { text-decoration: underline; }
+    /* Leaderboard tab switcher */
+    .lb-tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 10px;
+    }
+    .lb-tab {
+      flex: 1;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      text-align: center;
+      transition: color 100ms, background 100ms, border-color 100ms;
+    }
+    .lb-tab:hover { color: var(--fg); border-color: var(--fg); }
+    .lb-tab.lb-tab-active {
+      color: var(--accent-text);
+      border-color: var(--accent-text);
+      background: rgba(124, 58, 237, 0.08);
+    }
+    /* High-score row: rank | name | best-time | echoes | verified */
+    .hs-row {
+      display: grid;
+      grid-template-columns: 28px 1fr auto auto auto;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 4px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .hs-row:last-child { border-bottom: none; }
+    .hs-row-self {
+      background: rgba(124, 58, 237, 0.10);
+      border-radius: 6px;
+      border-bottom-color: transparent;
+      margin-bottom: 1px;
+    }
+    /* Best-time row in Your Stats panel */
+    .your-best-time {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .your-best-time .ybv { font-size: 13px; color: var(--fg); font-variant-numeric: tabular-nums; }
+    .your-best-time a { color: var(--accent-text); font-size: 11px; text-decoration: none; }
+    .your-best-time a:hover { text-decoration: underline; }
+    /* High-scores tab footer note */
+    .hs-footer { font-size: 11px; color: var(--muted); margin-top: 8px; text-align: center; }
 
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
@@ -700,6 +760,11 @@
             <div class="val" id="yourStatsMax">—</div>
           </div>
         </div>
+        <div class="your-best-time" id="yourBestTimeRow" style="display:none">
+          <span>Personal best:</span>
+          <span class="ybv" id="yourBestTimeVal">—</span>
+          <a id="yourBestTimeTxLink" href="#" target="_blank" rel="noopener" style="display:none" title="Verify on explorer">↗ cert</a>
+        </div>
         <div class="timing-section" id="yourLatencySection" style="display:none">
           <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your latency</div>
           <div style="position:relative;height:80px">
@@ -709,11 +774,22 @@
         <div class="diag-meta" id="yourStatsMeta"></div>
       </div>
 
-      <!-- Leaderboard — top senders ranked by confirmed tokens echoed -->
+      <!-- Leaderboard — top senders + high scores tabs -->
       <div class="card" id="leaderboardCard" style="display:none">
         <h2>Leaderboard</h2>
-        <div class="section-sub">Top senders on the current chain.</div>
-        <div id="leaderboard"></div>
+        <div class="lb-tabs">
+          <button class="lb-tab lb-tab-active" id="lbTabSenders" onclick="switchLbTab('senders')">Top Senders</button>
+          <button class="lb-tab" id="lbTabHighScores" onclick="switchLbTab('highscores')">High Scores</button>
+        </div>
+        <div id="lbPanelSenders">
+          <div class="section-sub">Top senders by total tokens echoed on the current chain.</div>
+          <div id="leaderboard"></div>
+        </div>
+        <div id="lbPanelHighScores" style="display:none">
+          <div class="section-sub">Fastest single round-trip per player, certified on-chain.</div>
+          <div id="highscores"></div>
+          <div class="hs-footer">Each score is certified by an on-chain transaction — click the link icon to verify on the explorer.</div>
+        </div>
       </div>
 
       <!-- Your attempts (per-device, localStorage) -->
@@ -817,6 +893,7 @@
     const STATE_POLL_MS = 2000;
     // Global echo log + diagnostics poll cadence (slower than state poll).
     const HISTORY_POLL_MS = 5000;
+    const LEADERBOARD_POLL_MS = 30000;
     const GLOBAL_LOG_PAGE = 25;
     const GLOBAL_LOG_CAP = 50;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
@@ -833,6 +910,8 @@
     })();
     // Resolved once: the wallet address we render "Your stats" for.
     let myStatsAddress = null;
+    // Tracks the last known personal best for new-best detection.
+    let lastKnownBestMs = Infinity;
 
     /* Map raw sidecar/server error strings to a short human explanation.
        The raw string is still shown as a muted detail line. */
@@ -2503,6 +2582,8 @@
         yourStatsMin.textContent = "—";
         yourStatsMax.textContent = "—";
         yourStatsMeta.textContent = "Connect your wallet to see your stats.";
+        const btRow = document.getElementById("yourBestTimeRow");
+        if (btRow) btRow.style.display = "none";
         return;
       }
       const total = stats && stats.total != null ? stats.total : 0;
@@ -2515,6 +2596,30 @@
       yourStatsAvg.textContent = (haveLat && stats.avgTotalMs != null) ? fmtMs(stats.avgTotalMs) : "—";
       yourStatsMin.textContent = (haveLat && stats.minTotalMs != null) ? fmtMs(stats.minTotalMs) : "—";
       yourStatsMax.textContent = (haveLat && stats.maxTotalMs != null) ? fmtMs(stats.maxTotalMs) : "—";
+
+      // Personal best row (from on-chain high score)
+      const btRow = document.getElementById("yourBestTimeRow");
+      const btVal = document.getElementById("yourBestTimeVal");
+      const btLink = document.getElementById("yourBestTimeTxLink");
+      if (btRow && btVal) {
+        const bms = stats && stats.bestLatencyMs != null ? stats.bestLatencyMs : null;
+        if (haveLat && bms != null) {
+          btRow.style.display = "flex";
+          btVal.textContent = fmtMs(bms);
+          if (btLink) {
+            const txId = stats && stats.bestLatencyTxId;
+            if (txId && EXPLORER_PUBLIC_BASE) {
+              btLink.href = EXPLORER_PUBLIC_BASE + "/tx/" + encodeURIComponent(txId);
+              btLink.style.display = "inline";
+            } else {
+              btLink.style.display = "none";
+            }
+          }
+        } else {
+          btRow.style.display = "none";
+        }
+      }
+
       if (total === 0) {
         yourStatsMeta.textContent = "Send your first echo to see your stats.";
         return;
@@ -2553,6 +2658,14 @@
         if (!r.ok) return;
         const data = await r.json();
         renderUserStats(data, true);
+        // Detect new personal best and show a toast.
+        const bms = data && data.bestLatencyMs != null ? data.bestLatencyMs : null;
+        if (bms != null && bms < lastKnownBestMs) {
+          if (lastKnownBestMs !== Infinity) {
+            showToast("success", "New Personal Best! " + fmtMs(bms), 4000);
+          }
+          lastKnownBestMs = bms;
+        }
       } catch (_) { /* ignore — next tick retries */ }
     }
 
@@ -2617,6 +2730,103 @@
         const data = await r.json();
         if (data && Array.isArray(data.entries)) {
           renderLeaderboard(data.entries);
+        }
+      } catch (_) {}
+    }
+
+    // Current active leaderboard tab: 'senders' | 'highscores'
+    let lbActiveTab = "senders";
+
+    function switchLbTab(tab) {
+      lbActiveTab = tab;
+      const panelSenders    = document.getElementById("lbPanelSenders");
+      const panelHighScores = document.getElementById("lbPanelHighScores");
+      const tabSenders      = document.getElementById("lbTabSenders");
+      const tabHighScores   = document.getElementById("lbTabHighScores");
+      if (!panelSenders || !panelHighScores) return;
+      if (tab === "highscores") {
+        panelSenders.style.display    = "none";
+        panelHighScores.style.display = "block";
+        tabSenders.classList.remove("lb-tab-active");
+        tabHighScores.classList.add("lb-tab-active");
+      } else {
+        panelSenders.style.display    = "block";
+        panelHighScores.style.display = "none";
+        tabSenders.classList.add("lb-tab-active");
+        tabHighScores.classList.remove("lb-tab-active");
+      }
+    }
+
+    function renderHighScores(entries) {
+      const card = document.getElementById("leaderboardCard");
+      const el   = document.getElementById("highscores");
+      if (!el) return;
+      if (card) card.style.display = "block";
+      el.innerHTML = "";
+      if (!entries || entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "No high scores recorded yet.";
+        el.appendChild(empty);
+        return;
+      }
+      entries.forEach((entry, idx) => {
+        const rank   = idx + 1;
+        const isSelf = myStatsAddress && entry.address === myStatsAddress;
+        const name   = leaderboardName(entry);
+        const row    = document.createElement("div");
+        row.className = "hs-row" + (isSelf ? " hs-row-self" : "");
+
+        const rankEl = document.createElement("div");
+        rankEl.className = "lb-rank" + (rank <= 3 ? " lb-rank-top" : "");
+        rankEl.textContent = rank;
+
+        const nameEl = document.createElement("div");
+        nameEl.className = "lb-name";
+        nameEl.textContent = name;
+        if (isSelf) nameEl.style.color = "var(--accent-text)";
+
+        const timeEl = document.createElement("div");
+        timeEl.className = "lb-best-time";
+        timeEl.textContent = fmtMs(entry.bestLatencyMs);
+
+        const echoesEl = document.createElement("div");
+        echoesEl.className = "lb-echoes";
+        echoesEl.textContent = entry.echoCount + "×";
+
+        const verifiedEl = document.createElement("div");
+        verifiedEl.className = "lb-verified";
+        if (entry.highscoreTxId && EXPLORER_PUBLIC_BASE) {
+          const a = document.createElement("a");
+          a.href = EXPLORER_PUBLIC_BASE + "/tx/" + encodeURIComponent(entry.highscoreTxId);
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.title = "Verify on explorer";
+          a.textContent = "↗";
+          verifiedEl.appendChild(a);
+        } else {
+          verifiedEl.textContent = "—";
+        }
+
+        row.appendChild(rankEl);
+        row.appendChild(nameEl);
+        row.appendChild(timeEl);
+        row.appendChild(echoesEl);
+        row.appendChild(verifiedEl);
+        el.appendChild(row);
+      });
+    }
+
+    async function pollHighScores() {
+      try {
+        const r = await fetch("/__echo/highscores", {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.entries)) {
+          renderHighScores(data.entries);
         }
       } catch (_) {}
     }
@@ -3511,9 +3721,10 @@
       fetchSuccessRate();
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
-      // Leaderboard: initial fetch + 30s auto-refresh.
+      // Leaderboard + High Scores: initial fetch + 30s auto-refresh (both tabs).
       pollLeaderboard();
-      setInterval(pollLeaderboard, 30000);
+      pollHighScores();
+      setInterval(() => { pollLeaderboard(); pollHighScores(); }, LEADERBOARD_POLL_MS);
 
       // Anomaly history: initial fetch + slow refresh (same cadence as leaderboard).
       fetchAnomalyHistory();

@@ -50,6 +50,8 @@ function emptyUserStats() {
     avgTotalMs: null,
     minTotalMs: null,
     maxTotalMs: null,
+    bestLatencyMs: null,
+    bestLatencyTxId: null,
   };
 }
 
@@ -605,6 +607,12 @@ function createEcho(opts) {
 
   function handleOutgoing(tx) {
     const memo = parseMemo(tx.memo);
+
+    // Skip highscore certificate TXs — they're from the echo wallet but have
+    // no matching echo event to confirm. Avoids iterating the events map
+    // unnecessarily and prevents false "unmatched" log noise.
+    if (memo && memo.app === APP_ID && memo.type === "highscore") return;
+
     const ref = memo && memo.app === APP_ID && memo.type === "echo" ? memo.ref : null;
 
     // Track every on-chain echo so the dedup short-circuit in handleIncoming
@@ -627,6 +635,7 @@ function createEcho(opts) {
           persistEvent(event);
           console.log(`[echo] confirmed (id-match): req=${event.requestTxId.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
           metrics.recordSample(event);
+          checkAndRecordHighScore(event);
         }
         return;
       }
@@ -654,8 +663,57 @@ function createEcho(opts) {
         persistEvent(event);
         console.log(`[echo] confirmed (memo-match): req=${ref.slice(0, 12)}… echo=${tx.id.slice(0, 12)}…`);
         metrics.recordSample(event);
+        checkAndRecordHighScore(event);
       }
     }
+  }
+
+  // Fire-and-forget: check if this confirmed event sets a new personal best
+  // for the sender, and if so UPSERT echo_highscores and send a 1-token
+  // on-chain certificate from the echo wallet to the sender.
+  function checkAndRecordHighScore(event) {
+    if (!event || event.echoConfirmedTs == null || event.requestTs == null) return;
+    const latencyMs = Math.max(0, event.echoConfirmedTs - event.requestTs);
+    if (latencyMs <= 0) return; // clamped clock skew — not a real score
+    if (!store.isReady() || typeof store.upsertHighScore !== "function") return;
+
+    const address = event.requestFrom;
+    const requestTxId = event.requestTxId;
+    const cid = effectiveChainId();
+
+    store.upsertHighScore(cid, address, latencyMs, requestTxId).then(async (isNewBest) => {
+      if (!isNewBest) return;
+      console.log(`[echo] new high score for ${address.slice(0, 16)}…: ${latencyMs}ms`);
+
+      // Only send the on-chain certificate in production (appSecretKey required).
+      if (!appSecretKey || localDev) return;
+      try {
+        const memoB64 = Buffer.from(JSON.stringify({
+          app: APP_ID,
+          type: "highscore",
+          latencyMs,
+          ref: requestTxId,
+        })).toString("base64url");
+        const resp = await httpJson("POST", `${nodeRpcUrl}/wallet/send`, {
+          from_pk_hash: appPubkey,
+          amount: 1,
+          to_pk_hash: address,
+          fee: 0,
+          memo: memoB64,
+        });
+        if (resp && resp.queued) {
+          const txId = resp.tx_id || resp.txid || resp.hash || null;
+          if (txId) {
+            await store.updateHighScoreTxId(cid, address, txId);
+            console.log(`[echo] high-score cert TX queued: ${txId.slice(0, 12)}…`);
+          }
+        }
+      } catch (e) {
+        console.error("[echo] high-score cert TX error:", e.message);
+      }
+    }).catch((e) => {
+      console.error("[echo] checkAndRecordHighScore error:", e.message);
+    });
   }
 
   // ── Sidecar interactions ─────────────────────────────────────────────────
@@ -794,6 +852,7 @@ function createEcho(opts) {
       persistEvent(event);
       console.log(`[echo] mock echo: ${replyAmount} → ${tx.from.slice(0, 16)}…`);
       metrics.recordSample(event);
+      checkAndRecordHighScore(event);
       return;
     }
 
@@ -1097,11 +1156,28 @@ function createEcho(opts) {
       stats = computeUserStatsFromMemory(address);
     }
 
+    // Augment with personal best from echo_highscores. Falls back to the
+    // minTotalMs computed from events when the DB is unavailable.
+    let bestLatencyMs = null;
+    let bestLatencyTxId = null;
+    if (valid && store.isReady() && typeof store.getHighScore === "function") {
+      const hs = await store.getHighScore(cid, address).catch(() => null);
+      if (hs) {
+        bestLatencyMs = hs.best_latency_ms;
+        bestLatencyTxId = hs.highscore_tx_id;
+      }
+    }
+    if (bestLatencyMs == null && stats && stats.minTotalMs != null) {
+      bestLatencyMs = stats.minTotalMs;
+    }
+
     sendJson(req, res, {
       address: valid ? address : null,
       chainId: cid,
       mode,
       ...stats,
+      bestLatencyMs,
+      bestLatencyTxId,
     });
   }
 
@@ -1238,6 +1314,15 @@ function createEcho(opts) {
     sendJson(req, res, { entries, chainId: cid, count: entries.length, mode });
   }
 
+  async function handleHighScores(req, res) {
+    const cid  = effectiveChainId();
+    let entries = [];
+    if (store.isReady() && typeof store.queryHighScores === "function") {
+      entries = await store.queryHighScores(cid, 50);
+    }
+    sendJson(req, res, { entries, chainId: cid, count: entries.length });
+  }
+
   // Capture the viewer's Usernode username (set by the JWT-verifying
   // middleware in server.js) keyed by their on-chain pubkey, so the
   // leaderboard can show real usernames instead of "user_…" id fallbacks.
@@ -1259,6 +1344,17 @@ function createEcho(opts) {
         if (!res.headersSent) {
           res.writeHead(500, JSON_HEADERS);
           res.end(JSON.stringify({ error: "leaderboard unavailable" }));
+        }
+      });
+      return true;
+    }
+    if (pathname === "/__echo/highscores" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
+      handleHighScores(req, res).catch((e) => {
+        console.error("[echo] highscores error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "highscores unavailable" }));
         }
       });
       return true;

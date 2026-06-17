@@ -74,6 +74,21 @@ CREATE TABLE IF NOT EXISTS echo_identities (
   username     TEXT NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Per-user on-chain high scores. One row per address (best single-round
+-- latency). When a user sets a new personal best, the server sends a
+-- certificate transaction on-chain and records its tx_id here.
+-- PUBLIC: latencies and addresses are already in the public echo log.
+CREATE TABLE IF NOT EXISTS echo_highscores (
+  address            TEXT PRIMARY KEY,
+  best_latency_ms    BIGINT NOT NULL,
+  highscore_tx_id    TEXT,
+  ref_request_tx_id  TEXT,
+  achieved_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  chain_id           TEXT
+);
+CREATE INDEX IF NOT EXISTS echo_highscores_chain_latency_idx
+  ON echo_highscores (chain_id, best_latency_ms ASC);
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -615,6 +630,103 @@ function createEchoStore(opts = {}) {
     }
   }
 
+  // UPSERT a personal best into echo_highscores. Returns true if a new best
+  // was recorded (the row was inserted or updated), false if the existing
+  // record is already better or on the same chain with a lower latency.
+  async function upsertHighScore(chainId, address, latencyMs, requestTxId) {
+    if (!isReady() || !address || !latencyMs || latencyMs <= 0) return false;
+    const r = await pool.query(
+      `INSERT INTO echo_highscores
+         (address, best_latency_ms, highscore_tx_id, ref_request_tx_id, achieved_at, chain_id)
+       VALUES ($1, $2, NULL, $3, now(), $4)
+       ON CONFLICT (address) DO UPDATE SET
+         best_latency_ms   = EXCLUDED.best_latency_ms,
+         highscore_tx_id   = NULL,
+         ref_request_tx_id = EXCLUDED.ref_request_tx_id,
+         achieved_at       = now(),
+         chain_id          = EXCLUDED.chain_id
+       WHERE echo_highscores.best_latency_ms > EXCLUDED.best_latency_ms
+          OR echo_highscores.chain_id IS DISTINCT FROM EXCLUDED.chain_id`,
+      [address, Math.trunc(latencyMs), requestTxId || null, chainId || null]
+    );
+    return (r.rowCount || 0) > 0;
+  }
+
+  // After the on-chain certificate TX lands, record its tx_id so the UI
+  // can link to the explorer. Only updates rows still awaiting a cert
+  // (highscore_tx_id IS NULL) to avoid clobbering a race winner.
+  async function updateHighScoreTxId(chainId, address, txId) {
+    if (!isReady() || !address || !txId) return;
+    await pool.query(
+      `UPDATE echo_highscores SET highscore_tx_id = $3
+       WHERE address = $1 AND chain_id IS NOT DISTINCT FROM $2
+         AND highscore_tx_id IS NULL`,
+      [address, chainId || null, txId]
+    ).catch((e) => console.error("[echo-store] updateHighScoreTxId error:", e.message));
+  }
+
+  // Fetch a single user's current personal-best row for the given chain.
+  // Returns null when disabled, the user has no record, or the chain differs.
+  async function getHighScore(chainId, address) {
+    if (!isReady() || !address) return null;
+    try {
+      const r = await pool.query(
+        `SELECT best_latency_ms, highscore_tx_id
+         FROM echo_highscores
+         WHERE address = $1 AND chain_id IS NOT DISTINCT FROM $2`,
+        [address, chainId || null]
+      );
+      if (!r.rows.length) return null;
+      return {
+        best_latency_ms: numOrNull(r.rows[0].best_latency_ms),
+        highscore_tx_id: r.rows[0].highscore_tx_id || null,
+      };
+    } catch (e) {
+      console.error("[echo-store] getHighScore error:", e.message);
+      return null;
+    }
+  }
+
+  // Top personal bests ranked ascending by best_latency_ms for the given chain.
+  // Joins echo_identities for usernames and echo_events for echo_count.
+  async function queryHighScores(chainId, limit = 50) {
+    if (!isReady()) return [];
+    const lim = Math.max(1, Math.min(100, limit || 50));
+    const sql = `
+      SELECT
+        hs.address,
+        hs.best_latency_ms,
+        hs.highscore_tx_id,
+        EXTRACT(EPOCH FROM hs.achieved_at) * 1000 AS achieved_at_ms,
+        COALESCE(id.username, MAX(e.username)) AS username,
+        COUNT(e.request_tx_id) FILTER (WHERE e.status = 'confirmed')::int AS echo_count
+      FROM echo_highscores hs
+      LEFT JOIN echo_identities id ON id.address = hs.address
+      LEFT JOIN echo_events e
+             ON e.request_from = hs.address
+            AND e.chain_id IS NOT DISTINCT FROM hs.chain_id
+      WHERE hs.chain_id IS NOT DISTINCT FROM $1
+      GROUP BY hs.address, hs.best_latency_ms, hs.highscore_tx_id,
+               hs.achieved_at, id.username
+      ORDER BY hs.best_latency_ms ASC
+      LIMIT $2
+    `;
+    try {
+      const r = await pool.query(sql, [chainId || null, lim]);
+      return r.rows.map((row) => ({
+        address: row.address,
+        bestLatencyMs: numOrNull(row.best_latency_ms),
+        highscoreTxId: row.highscore_tx_id || null,
+        achievedAt: numOrNull(row.achieved_at_ms),
+        username: row.username || null,
+        echoCount: row.echo_count || 0,
+      }));
+    } catch (e) {
+      console.error("[echo-store] queryHighScores error:", e.message);
+      return [];
+    }
+  }
+
   async function prune() {
     if (!isReady()) return;
     // Age-based prune across all chains.
@@ -936,6 +1048,53 @@ function createEchoStore(opts = {}) {
       }
     }
     if (lbSeeded > 0) console.log(`[echo-store] seeded ${lbSeeded} staging leaderboard demo rows`);
+
+    // High-scores demo rows — one per LB sender with best latencies that
+    // produce a ranking deliberately different from the top-senders order,
+    // so both leaderboard tabs show meaningfully different orderings.
+    // DEMO_STATS_PUBKEY is included so the ?demo=1 tester appears there too.
+    // highscore_tx_id is NULL (no real on-chain cert in staging).
+    const HS_ROWS = [
+      { suffix: "a", latency:  8400 },
+      { suffix: "b", latency:  1200 },
+      { suffix: "c", latency:  3100 },
+      { suffix: "d", latency:   800 },
+      { suffix: "e", latency: 12000 },
+      { suffix: "f", latency:  2000 },
+      { suffix: "g", latency:  6000 },
+      { suffix: "h", latency:  4500 },
+    ];
+    let hsSeeded = 0;
+    for (const h of HS_ROWS) {
+      const addr = `ut1lbdemo${h.suffix}0000000000000000000000000000000000000000000`;
+      const refTxId = `staging-lb-${h.suffix}-000`;
+      try {
+        const { rowCount } = await pool.query(
+          `INSERT INTO echo_highscores
+             (address, best_latency_ms, highscore_tx_id, ref_request_tx_id, achieved_at, chain_id)
+           VALUES ($1, $2, NULL, $3, now(), $4)
+           ON CONFLICT (address) DO NOTHING`,
+          [addr, h.latency, refTxId, chainId || null]
+        );
+        hsSeeded += rowCount || 0;
+      } catch (e) {
+        console.warn("[echo-store] hs seed row failed:", e.message);
+      }
+    }
+    // DEMO_STATS_PUBKEY high-score row
+    try {
+      const { rowCount } = await pool.query(
+        `INSERT INTO echo_highscores
+           (address, best_latency_ms, highscore_tx_id, ref_request_tx_id, achieved_at, chain_id)
+         VALUES ($1, $2, NULL, $3, now(), $4)
+         ON CONFLICT (address) DO NOTHING`,
+        [DEMO_STATS_PUBKEY, 1500, "staging-lb-demo-000", chainId || null]
+      );
+      hsSeeded += rowCount || 0;
+    } catch (e) {
+      console.warn("[echo-store] hs demo seed row failed:", e.message);
+    }
+    if (hsSeeded > 0) console.log(`[echo-store] seeded ${hsSeeded} staging high-score demo rows`);
   }
 
   async function close() {
@@ -948,6 +1107,7 @@ function createEchoStore(opts = {}) {
   return { init, isReady, persist, hydrate, queryHistory, queryStats,
            getLeaderboard, queryUserStats, queryUserLatencyHistory,
            getSuccessRateBuckets, queryLeaderboard,
+           upsertHighScore, updateHighScoreTxId, getHighScore, queryHighScores,
            recordIdentity, lookupIdentity,
            seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
 }
