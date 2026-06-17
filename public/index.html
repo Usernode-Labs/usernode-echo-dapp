@@ -492,6 +492,21 @@
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
+    /* Leaderboard time-window tabs */
+    .lb-tab-bar { display: flex; gap: 4px; margin-bottom: 10px; }
+    .lb-tab {
+      font-size: 12px; padding: 3px 10px;
+      border-radius: 12px; border: 1px solid var(--border);
+      background: none; color: var(--muted); cursor: pointer;
+    }
+    .lb-tab.active {
+      background: var(--accent); border-color: var(--accent);
+      color: var(--accent-text);
+    }
+    .lb-partial-note {
+      font-size: 11px; color: var(--muted); margin-top: 8px; text-align: center;
+    }
+
     .footer-note {
       text-align: center; font-size: 11px; color: var(--muted);
       padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -755,8 +770,13 @@
       <!-- Leaderboard — top senders ranked by confirmed tokens echoed -->
       <div class="card" id="leaderboardCard" style="display:none">
         <h2>Leaderboard</h2>
-        <div class="section-sub">Top senders on the current chain.</div>
+        <div class="lb-tab-bar" id="lbTabBar1">
+          <button class="lb-tab" data-window="1d">Today</button>
+          <button class="lb-tab" data-window="7d">7 Days</button>
+          <button class="lb-tab active" data-window="all">All Time</button>
+        </div>
         <div id="leaderboard"></div>
+        <div class="lb-partial-note" id="lbPartialNote1" style="display:none">Showing recent in-memory data only — full history requires Postgres.</div>
       </div>
 
       <!-- Your attempts (per-device, localStorage) -->
@@ -1335,6 +1355,10 @@
     // Tracks whether the health banner is showing a latency anomaly so the
     // trend chart can tint its signal line accordingly.
     let latencyAnomaly = false;
+
+    // Active time-window for the leaderboard.
+    let leaderboardWindow = "all";
+
 
     // Currently open accordion row (only one at a time).
     let openRow = null;
@@ -2625,13 +2649,15 @@
       } catch (_) { /* ignore — next tick retries */ }
     }
 
-    /* ── Leaderboard ─────────────────────────────────────────── */
-    function renderLeaderboard(entries) {
-      const card = document.getElementById("leaderboardCard");
-      const el   = document.getElementById("leaderboard");
+    /* ── Leaderboard (card-based) ────────────────────────────── */
+    function renderLeaderboardCards(entries) {
+      const card    = document.getElementById("leaderboardCard");
+      const el      = document.getElementById("leaderboard");
+      const noteEl  = document.getElementById("lbPartialNote1");
       if (!card || !el) return;
       card.style.display = "block";
       el.innerHTML = "";
+      if (noteEl) noteEl.style.display = (entries && entries._partialInMemory) ? "block" : "none";
       if (!entries || entries.length === 0) {
         const empty = document.createElement("div");
         empty.className = "history-empty";
@@ -2678,16 +2704,26 @@
 
     async function pollLeaderboard() {
       try {
-        const r = await fetch("/__echo/leaderboard", {
+        const r = await fetch("/__echo/leaderboard?window=" + leaderboardWindow, {
           cache: "no-store",
           headers: authHeaders(),
         });
         if (!r.ok) return;
         const data = await r.json();
-        if (data && Array.isArray(data.entries)) {
-          renderLeaderboard(data.entries);
+        if (data && Array.isArray(data.rows)) {
+          const rows = data.rows;
+          rows._partialInMemory = !!data.partialInMemory;
+          renderLeaderboardCards(rows);
         }
       } catch (_) {}
+    }
+
+    function setLeaderboardWindow(win) {
+      leaderboardWindow = win;
+      document.querySelectorAll(".lb-tab").forEach(function (btn) {
+        btn.classList.toggle("active", btn.dataset.window === win);
+      });
+      pollLeaderboard();
     }
 
     /* ── Success Rate Over Time chart ────────────────────────── */
@@ -3580,7 +3616,7 @@
       fetchSuccessRate();
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
-      // Leaderboard: initial fetch + 30s auto-refresh.
+      // Leaderboard (card-based): initial fetch + 30s auto-refresh.
       pollLeaderboard();
       setInterval(pollLeaderboard, 30000);
 
