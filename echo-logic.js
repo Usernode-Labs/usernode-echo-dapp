@@ -1016,6 +1016,56 @@ function createEcho(opts) {
     sendJson(req, res, { events: events_, nextCursor, stats, mode });
   }
 
+  // Human-readable labels for each metric key. Mirrors METRICS in echo-metrics.js
+  // plus the two threshold-only metrics that aren't in that map.
+  const ANOMALY_METRIC_LABELS = {
+    chain_rtt_ms:       "chain round-trip",
+    poll_lag_ms:        "poll detect lag",
+    echo_queue_ms:      "echo build + RPC",
+    rpc_send_ms:        "wallet/send RPC",
+    failure_rate:       "failure rate",
+    skip_rate:          "skip rate",
+    retry_rate:         "retries/echo",
+    request_volume:     "request volume",
+    unconfirmed_age_ms: "echo stall",
+    clock_skew:         "clock skew",
+  };
+
+  // Public anomaly history: GET /__echo/anomaly-history. Returns a
+  // sanitised list of open + recently-resolved anomalies (no operator
+  // fields like robustZ or baselineValue). Same CORS posture as
+  // /__echo/leaderboard — permissive, no auth required.
+  function handleAnomalyHistory(req, res) {
+    const raw = metrics.getAnomaliesResponse();
+    const open = (raw.openAnomalies || []).map((a) => ({
+      id: a.id,
+      metric: a.metric,
+      metricLabel: ANOMALY_METRIC_LABELS[a.metric] || a.metric,
+      severity: a.severity,
+      status: "open",
+      note: a.note,
+      openedAtMs: a.openedAtMs,
+      lastSeenAtMs: a.lastSeenAtMs,
+      resolvedAtMs: null,
+    })).sort((a, b) => b.openedAtMs - a.openedAtMs);
+
+    const resolved = (raw.recentResolved || []).map((a) => ({
+      id: a.id,
+      metric: a.metric,
+      metricLabel: ANOMALY_METRIC_LABELS[a.metric] || a.metric,
+      severity: a.severity,
+      status: "resolved",
+      note: a.note,
+      openedAtMs: a.openedAtMs,
+      lastSeenAtMs: a.lastSeenAtMs,
+      resolvedAtMs: a.resolvedAtMs,
+    })).sort((a, b) => b.openedAtMs - a.openedAtMs);
+
+    const anomalies = open.concat(resolved).slice(0, 50);
+    sendJson(req, res, { openCount: open.length, anomalies });
+  }
+
+
   // Public per-user aggregate: GET /__echo/my-stats?address=<pubkey>. Same
   // posture as /__echo/state and /__echo/history (no /api/ prefix, no auth,
   // no-store). Scopes to the current chain. The address is caller-supplied;
@@ -1151,6 +1201,7 @@ function createEcho(opts) {
         tokensSent: a.tokensSent,
         echoCount: a.echoCount,
         avgLatencyMs: a.latCount > 0 ? a.latSum / a.latCount : null,
+        username: typeof store.lookupIdentity === "function" ? store.lookupIdentity(address) : null,
       }))
       .sort((a, b) => b.tokensSent - a.tokensSent)
       .slice(0, lim);
@@ -1197,7 +1248,20 @@ function createEcho(opts) {
     sendJson(req, res, { rows, window, partialInMemory, chainId: cid, count: rows.length, mode });
   }
 
+  // Capture the viewer's Usernode username (set by the JWT-verifying
+  // middleware in server.js) keyed by their on-chain pubkey, so the
+  // leaderboard can show real usernames instead of "user_…" id fallbacks.
+  // Echo stays public — this never gates a request, it only records.
+  function captureIdentity(req) {
+    const u = req && req.user;
+    if (!u || typeof store.recordIdentity !== "function") return;
+    const addr = u.usernode_pubkey || u.usernodePubkey || null;
+    const name = u.username || null;
+    if (addr && name) store.recordIdentity(addr, name);
+  }
+
   function handleRequest(req, res, pathname) {
+    if (pathname.startsWith("/__echo/")) captureIdentity(req);
     if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
       handleLeaderboard(req, res).catch((e) => {
@@ -1222,6 +1286,11 @@ function createEcho(opts) {
           res.end(JSON.stringify({ error: "my-stats unavailable" }));
         }
       });
+      return true;
+    }
+    if (pathname === "/__echo/anomaly-history" && (req.method === "GET" || req.method === "HEAD")) {
+      if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
+      handleAnomalyHistory(req, res);
       return true;
     }
     if (pathname === "/__echo/my-latency-history" && (req.method === "GET" || req.method === "HEAD")) {
