@@ -880,6 +880,8 @@
     const STATE_POLL_MS = 2000;
     // Global echo log + diagnostics poll cadence (slower than state poll).
     const HISTORY_POLL_MS = 5000;
+    // Leaderboard / anomaly-history poll cadence (slowest — these change rarely).
+    const LEADERBOARD_POLL_MS = 60000;
     const GLOBAL_LOG_PAGE = 25;
     const GLOBAL_LOG_CAP = 50;
     const EXPLORER_BASE = window.location.origin + "/explorer-api";
@@ -3617,6 +3619,12 @@
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
       // Leaderboard (card-based): initial fetch + 30s auto-refresh.
+      // Wire the Today / 7 Days / All Time tab buttons to switch the window.
+      document.querySelectorAll(".lb-tab").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          setLeaderboardWindow(btn.dataset.window);
+        });
+      });
       pollLeaderboard();
       setInterval(pollLeaderboard, 30000);
 
