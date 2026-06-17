@@ -475,9 +475,16 @@
       border-bottom: 1px solid var(--border);
       font-size: 13px;
     }
+    .lb-has-stars .lb-row { grid-template-columns: 28px 1fr auto auto auto 20px; }
     .lb-row:last-child { border-bottom: none; }
     .lb-row-self {
       background: rgba(124, 58, 237, 0.10);
+      border-radius: 6px;
+      border-bottom-color: transparent;
+      margin-bottom: 1px;
+    }
+    .lb-row-fav {
+      background: rgba(124, 58, 237, 0.05);
       border-radius: 6px;
       border-bottom-color: transparent;
       margin-bottom: 1px;
@@ -491,6 +498,14 @@
     .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
     .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
     .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .lb-star {
+      background: none; border: none; padding: 0 2px; cursor: pointer;
+      font-size: 14px; color: var(--muted); line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .lb-star:hover { color: var(--fg); }
+    .lb-star.is-fav { color: var(--accent-text); }
+    .lb-star-spacer { width: 20px; }
 
     /* Leaderboard time-window tabs */
     .lb-tab-bar { display: flex; gap: 4px; margin-bottom: 10px; }
@@ -896,6 +911,12 @@
     })();
     // Resolved once: the wallet address we render "Your stats" for.
     let myStatsAddress = null;
+    // Addresses the signed-in viewer has starred on the leaderboard.
+    let myFavorites = new Set();
+    // Last leaderboard entries received — cached so star toggles can re-render.
+    let lastLeaderboardEntries = null;
+    // Tracks in-flight toggle requests (per address) to debounce rapid taps.
+    const _favPending = new Map();
 
     /* Map raw sidecar/server error strings to a short human explanation.
        The raw string is still shown as a muted detail line. */
@@ -2651,6 +2672,7 @@
 
     /* ── Leaderboard (card-based) ────────────────────────────── */
     function renderLeaderboardCards(entries) {
+      lastLeaderboardEntries = entries; // cache for star-toggle re-renders
       const card    = document.getElementById("leaderboardCard");
       const el      = document.getElementById("leaderboard");
       const noteEl  = document.getElementById("lbPartialNote1");
@@ -2659,18 +2681,38 @@
       el.innerHTML = "";
       if (noteEl) noteEl.style.display = (entries && entries._partialInMemory) ? "block" : "none";
       if (!entries || entries.length === 0) {
+        el.classList.remove("lb-has-stars");
         const empty = document.createElement("div");
         empty.className = "history-empty";
         empty.textContent = "No echoes recorded yet.";
         el.appendChild(empty);
         return;
       }
-      entries.forEach((entry, idx) => {
-        const rank = idx + 1;
+
+      const showStars = !!PLATFORM_TOKEN;
+      if (showStars) el.classList.add("lb-has-stars");
+      else el.classList.remove("lb-has-stars");
+
+      // Tag each entry with its true rank (by server-returned order) before sorting.
+      const ranked = entries.map((entry, idx) => ({ entry, rank: idx + 1 }));
+
+      // Favorites float to the top; within each group, original rank is preserved.
+      const sorted = showStars
+        ? ranked.slice().sort((a, b) => {
+            const af = myFavorites.has(a.entry.address) ? 0 : 1;
+            const bf = myFavorites.has(b.entry.address) ? 0 : 1;
+            return af !== bf ? af - bf : a.rank - b.rank;
+          })
+        : ranked;
+
+      sorted.forEach(({ entry, rank }) => {
         const isSelf = myStatsAddress && entry.address === myStatsAddress;
+        const isFav  = myFavorites.has(entry.address);
         const name = leaderboardName(entry);
         const row = document.createElement("div");
-        row.className = "lb-row" + (isSelf ? " lb-row-self" : "");
+        row.className = "lb-row" +
+          (isSelf ? " lb-row-self" : "") +
+          (isFav && !isSelf ? " lb-row-fav" : "");
 
         const rankEl = document.createElement("div");
         rankEl.className = "lb-rank" + (rank <= 3 ? " lb-rank-top" : "");
@@ -2698,8 +2740,78 @@
         row.appendChild(tokensEl);
         row.appendChild(echoesEl);
         row.appendChild(latencyEl);
+
+        if (showStars) {
+          if (isSelf) {
+            // Spacer so grid columns align when the row has no interactive star.
+            const sp = document.createElement("div");
+            sp.className = "lb-star-spacer";
+            row.appendChild(sp);
+          } else {
+            const starBtn = document.createElement("button");
+            starBtn.className = "lb-star" + (isFav ? " is-fav" : "");
+            starBtn.setAttribute("aria-label", isFav ? "Unstar" : "Star");
+            starBtn.textContent = isFav ? "★" : "☆";
+            starBtn.addEventListener("click", function (e) {
+              e.stopPropagation();
+              toggleFavorite(entry.address);
+            });
+            row.appendChild(starBtn);
+          }
+        }
+
         el.appendChild(row);
       });
+    }
+
+    async function fetchFavorites() {
+      if (!PLATFORM_TOKEN) return; // stars only for signed-in viewers
+      try {
+        const params = new URLSearchParams();
+        if (IS_DEMO) params.set("demo", "1");
+        const r = await fetch("/__echo/favorites?" + params.toString(), {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.favorites)) {
+          myFavorites = new Set(data.favorites);
+          // Re-render with updated favorites if data is already loaded.
+          if (lastLeaderboardEntries) renderLeaderboardCards(lastLeaderboardEntries);
+        }
+      } catch (_) {}
+    }
+
+    async function toggleFavorite(address) {
+      if (_favPending.has(address)) return; // debounce rapid taps
+      _favPending.set(address, true);
+      const wasFav = myFavorites.has(address);
+      // Optimistic update
+      if (wasFav) myFavorites.delete(address); else myFavorites.add(address);
+      if (lastLeaderboardEntries) renderLeaderboardCards(lastLeaderboardEntries);
+      try {
+        if (wasFav) {
+          const r = await fetch(
+            "/__echo/favorites?" + new URLSearchParams({ address }).toString(),
+            { method: "DELETE", headers: authHeaders() }
+          );
+          if (!r.ok) throw new Error("delete failed");
+        } else {
+          const r = await fetch("/__echo/favorites", {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ address }),
+          });
+          if (!r.ok) throw new Error("add failed");
+        }
+      } catch (_) {
+        // Revert on failure
+        if (wasFav) myFavorites.add(address); else myFavorites.delete(address);
+        if (lastLeaderboardEntries) renderLeaderboardCards(lastLeaderboardEntries);
+      } finally {
+        _favPending.delete(address);
+      }
     }
 
     async function pollLeaderboard() {
@@ -3617,6 +3729,8 @@
       setInterval(fetchSuccessRate, HISTORY_POLL_MS);
 
       // Leaderboard (card-based): initial fetch + 30s auto-refresh.
+      // Favorites are fetched once on load (stars appear after the first render).
+      fetchFavorites();
       pollLeaderboard();
       setInterval(pollLeaderboard, 30000);
 
