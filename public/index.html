@@ -17,6 +17,10 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>UsernodeLoading.init({ appName: "Echo", streamKey: "echo" });</script>
   <meta name="x-app-version" content="__BUILD_VERSION__" />
+  <script>
+    /* Apply saved skin immediately to avoid flash of default theme on return visits. */
+    (function() { var s = localStorage.getItem("echo:skin"); if (s) document.documentElement.setAttribute("data-skin", s); })();
+  </script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     /* Dark theme with a single vibrant violet accent. Tokens drive the
@@ -36,15 +40,45 @@
       --warn: #fbbf24;
       --err: #fb7185;
       --chip-bg: rgba(139, 92, 246, 0.16);
+      --glow-color: rgba(124, 58, 237, 0.16);
     }
+    /* ── Skin themes ─────────────────────────────────────────── */
+    html[data-skin="midnight"] {
+      --bg: #050d1a; --card: #0c1629;
+      --accent: #0e7fc4; --accent-hover: #2190cc; --accent-text: #67b8e8;
+      --chip-bg: rgba(14, 127, 196, 0.16); --glow-color: rgba(14, 127, 196, 0.16);
+    }
+    html[data-skin="forest"] {
+      --bg: #080f0b; --card: #0c1510;
+      --accent: #0f8e5b; --accent-hover: #22a06e; --accent-text: #6ed9a4;
+      --chip-bg: rgba(15, 142, 91, 0.16); --glow-color: rgba(15, 142, 91, 0.16);
+    }
+    html[data-skin="crimson"] {
+      --bg: #100808; --card: #1a0e0e;
+      --accent: #be2a2a; --accent-hover: #cc3d3d; --accent-text: #f07070;
+      --chip-bg: rgba(190, 42, 42, 0.16); --glow-color: rgba(190, 42, 42, 0.16);
+    }
+    html[data-skin="solar"] {
+      --bg: #100c04; --card: #1a1208;
+      --accent: #c47a0e; --accent-hover: #cf8e25; --accent-text: #e8be5a;
+      --chip-bg: rgba(196, 122, 14, 0.16); --glow-color: rgba(196, 122, 14, 0.16);
+    }
+    /* ── Skin picker swatches ────────────────────────────────── */
+    .skin-swatch {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid transparent; cursor: pointer; padding: 0;
+      flex-shrink: 0; transition: transform 0.1s;
+    }
+    .skin-swatch:hover { transform: scale(1.18); }
+    .skin-swatch.skin-active { border-color: var(--fg); }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     body {
       margin: 0;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
         Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      /* Subtle violet glow at the top freshens the flat dark surface. */
+      /* Subtle glow at the top — color follows active skin. */
       background:
-        radial-gradient(1100px 520px at 50% -12%, rgba(124, 58, 237, 0.16), transparent 62%),
+        radial-gradient(1100px 520px at 50% -12%, var(--glow-color), transparent 62%),
         var(--bg);
       color: var(--fg);
       display: flex; flex-direction: column;
@@ -532,7 +566,16 @@
         <h1>Echo</h1>
         <div class="sub">Send N tokens, get N-1 back. Measures sidecar round-trip latency.</div>
       </div>
-      <span class="modePill" id="modePill">…</span>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+        <div id="skinPicker" style="display:none;align-items:center;gap:4px">
+          <button class="skin-swatch" data-skin-id="violet"  title="Violet"  style="background:#7c3aed"></button>
+          <button class="skin-swatch" data-skin-id="midnight" title="Midnight" style="background:#0e7fc4"></button>
+          <button class="skin-swatch" data-skin-id="forest"  title="Forest"  style="background:#0f8e5b"></button>
+          <button class="skin-swatch" data-skin-id="crimson" title="Crimson" style="background:#be2a2a"></button>
+          <button class="skin-swatch" data-skin-id="solar"   title="Solar"   style="background:#c47a0e"></button>
+        </div>
+        <span class="modePill" id="modePill">…</span>
+      </div>
     </div>
   </div>
 
@@ -1751,6 +1794,7 @@
         balanceResolvedOnce = true;
         if (balancePromise === p) balancePromise = null;
         updateMaxVisibility();
+        if (balanceAddr != null) showSkinPicker();
       });
       return p;
     }
@@ -1763,6 +1807,31 @@
       const noWallet = balanceResolvedOnce && !balanceDemo && balanceAddr == null;
       maxBtn.style.display = noWallet ? "none" : "";
     }
+
+    /* ── Skin picker ─────────────────────────────────────────── */
+    const skinPicker = document.getElementById("skinPicker");
+    const skinSwatches = skinPicker ? skinPicker.querySelectorAll(".skin-swatch") : [];
+
+    function applySkinActive(skinId) {
+      skinSwatches.forEach(function(btn) {
+        btn.classList.toggle("skin-active", btn.dataset.skinId === skinId);
+      });
+    }
+
+    function showSkinPicker() {
+      if (!skinPicker) return;
+      skinPicker.style.display = "flex";
+      applySkinActive(document.documentElement.getAttribute("data-skin") || "violet");
+    }
+
+    skinSwatches.forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        var id = btn.dataset.skinId;
+        document.documentElement.setAttribute("data-skin", id);
+        try { localStorage.setItem("echo:skin", id); } catch (_) {}
+        applySkinActive(id);
+      });
+    });
 
     function setMaxLoading(on) {
       if (!maxBtn) return;
