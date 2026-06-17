@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS echo_identities (
   username     TEXT NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- User favorites: per-user list of favorited leaderboard addresses.
+-- staging:private — copied schema-only to staging, seeded with fake demo data.
+CREATE TABLE IF NOT EXISTS echo_favorites (
+  user_id                TEXT PRIMARY KEY,
+  favorite_addresses     JSONB NOT NULL DEFAULT '[]'::jsonb,
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE echo_favorites IS 'staging:private';
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -989,6 +998,74 @@ function createEchoStore(opts = {}) {
     if (recentSeeded > 0) console.log(`[echo-store] seeded ${recentSeeded} recent leaderboard demo rows`);
   }
 
+  async function getFavorites(userId) {
+    if (!pool || !userId) return [];
+    try {
+      const res = await pool.query(
+        'SELECT favorite_addresses FROM echo_favorites WHERE user_id = $1',
+        [userId]
+      );
+      if (res.rows.length === 0) return [];
+      const addrs = res.rows[0].favorite_addresses;
+      return Array.isArray(addrs) ? addrs : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function addFavorite(userId, address) {
+    if (!pool || !userId || !address) return false;
+    try {
+      const res = await pool.query(
+        `INSERT INTO echo_favorites (user_id, favorite_addresses)
+         VALUES ($1, jsonb_build_array($2))
+         ON CONFLICT (user_id) DO UPDATE
+         SET favorite_addresses =
+           CASE WHEN NOT echo_favorites.favorite_addresses @> jsonb_build_array($2)
+                THEN echo_favorites.favorite_addresses || jsonb_build_array($2)
+                ELSE echo_favorites.favorite_addresses
+           END,
+           updated_at = now()`,
+        [userId, address]
+      );
+      return res.rowCount > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function removeFavorite(userId, address) {
+    if (!pool || !userId || !address) return false;
+    try {
+      await pool.query(
+        `UPDATE echo_favorites
+         SET favorite_addresses = favorite_addresses - $2,
+             updated_at = now()
+         WHERE user_id = $1`,
+        [userId, address]
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function seedStagingFavorites(userId) {
+    if (!pool || !userId) return;
+    try {
+      const demoAddresses = [
+        "ut1stagingrankone000000000000000000000000000000000000001rank1",
+        "ut1stagingrankthree0000000000000000000000000000000000rank3"
+      ];
+      await pool.query(
+        'INSERT INTO echo_favorites (user_id, favorite_addresses) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING',
+        [userId, JSON.stringify(demoAddresses)]
+      );
+    } catch (_) {
+      // Seed failure is non-fatal
+    }
+  }
+
   async function close() {
     if (pruneTimer) clearInterval(pruneTimer);
     if (pool) {
@@ -1000,6 +1077,7 @@ function createEchoStore(opts = {}) {
            getLeaderboard, queryUserStats, queryUserLatencyHistory,
            getSuccessRateBuckets, queryLeaderboard,
            recordIdentity, lookupIdentity,
+           getFavorites, addFavorite, removeFavorite, seedStagingFavorites,
            seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
 }
 

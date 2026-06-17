@@ -1248,6 +1248,85 @@ function createEcho(opts) {
     sendJson(req, res, { rows, window, partialInMemory, chainId: cid, count: rows.length, mode });
   }
 
+  async function handleFavoritesGet(req, res) {
+    const u = req && req.user;
+    const userId = u && (u.usernode_pubkey || u.usernodePubkey) ? (u.usernode_pubkey || u.usernodePubkey) : null;
+    if (!userId || !store.getFavorites) {
+      sendJson(req, res, { favorites: [] });
+      return;
+    }
+    try {
+      const favs = await store.getFavorites(userId);
+      sendJson(req, res, { favorites: favs || [] });
+    } catch (_) {
+      sendJson(req, res, { favorites: [] });
+    }
+  }
+
+  async function handleFavoritesPost(req, res) {
+    const u = req && req.user;
+    const userId = u && (u.usernode_pubkey || u.usernodePubkey) ? (u.usernode_pubkey || u.usernodePubkey) : null;
+    if (!userId) {
+      res.writeHead(401, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "Not authenticated" }));
+      return;
+    }
+    if (!store.addFavorite) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "Favorites not available" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const data = JSON.parse(body);
+        const address = data && data.address ? String(data.address).trim() : null;
+        if (!address || !/^ut1[a-z0-9]{50,}$/i.test(address)) {
+          res.writeHead(400, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "Invalid address" }));
+          return;
+        }
+        const ok = await store.addFavorite(userId, address);
+        res.writeHead(ok ? 200 : 500, JSON_HEADERS);
+        res.end(JSON.stringify({ success: ok }));
+      } catch (_) {
+        res.writeHead(400, JSON_HEADERS);
+        res.end(JSON.stringify({ error: "Invalid request" }));
+      }
+    });
+  }
+
+  async function handleFavoritesDelete(req, res) {
+    const u = req && req.user;
+    const userId = u && (u.usernode_pubkey || u.usernodePubkey) ? (u.usernode_pubkey || u.usernodePubkey) : null;
+    if (!userId) {
+      res.writeHead(401, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "Not authenticated" }));
+      return;
+    }
+    if (!store.removeFavorite) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "Favorites not available" }));
+      return;
+    }
+    try {
+      const url = new URL(req.url, "http://x");
+      const address = url.searchParams.get("address");
+      if (!address || !/^ut1[a-z0-9]{50,}$/i.test(address)) {
+        res.writeHead(400, JSON_HEADERS);
+        res.end(JSON.stringify({ error: "Invalid address" }));
+        return;
+      }
+      const ok = await store.removeFavorite(userId, address);
+      res.writeHead(ok ? 200 : 500, JSON_HEADERS);
+      res.end(JSON.stringify({ success: ok }));
+    } catch (_) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "Invalid request" }));
+    }
+  }
+
   // Capture the viewer's Usernode username (set by the JWT-verifying
   // middleware in server.js) keyed by their on-chain pubkey, so the
   // leaderboard can show real usernames instead of "user_…" id fallbacks.
@@ -1262,6 +1341,36 @@ function createEcho(opts) {
 
   function handleRequest(req, res, pathname) {
     if (pathname.startsWith("/__echo/")) captureIdentity(req);
+    if (pathname === "/__echo/favorites" && req.method === "GET") {
+      handleFavoritesGet(req, res).catch((e) => {
+        console.error("[echo] favorites GET error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ favorites: [] }));
+        }
+      });
+      return true;
+    }
+    if (pathname === "/__echo/favorites" && req.method === "POST") {
+      handleFavoritesPost(req, res).catch((e) => {
+        console.error("[echo] favorites POST error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "Internal error" }));
+        }
+      });
+      return true;
+    }
+    if (pathname === "/__echo/favorites" && req.method === "DELETE") {
+      handleFavoritesDelete(req, res).catch((e) => {
+        console.error("[echo] favorites DELETE error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, JSON_HEADERS);
+          res.end(JSON.stringify({ error: "Internal error" }));
+        }
+      });
+      return true;
+    }
     if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
       handleLeaderboard(req, res).catch((e) => {
@@ -1415,6 +1524,9 @@ function createEcho(opts) {
         });
         store.seedStagingLeaderboard(effectiveChainId()).catch((e) => {
           console.warn("[echo] staging leaderboard seed failed:", e.message);
+        });
+        store.seedStagingFavorites(DEMO_STATS_PUBKEY).catch((e) => {
+          console.warn("[echo] staging favorites seed failed:", e.message);
         });
       }
     })();
