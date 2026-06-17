@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS echo_identities (
   username     TEXT NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Per-user leaderboard favorites. staging:private — each row reveals only
+-- the owner's personal preference; never included in any public API response.
+CREATE TABLE IF NOT EXISTS echo_favorites (
+  owner_pubkey   TEXT NOT NULL,
+  target_address TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (owner_pubkey, target_address)
+);
+COMMENT ON TABLE echo_favorites IS 'staging:private';
+CREATE INDEX IF NOT EXISTS echo_favorites_owner_idx ON echo_favorites (owner_pubkey);
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -615,6 +626,55 @@ function createEchoStore(opts = {}) {
     }
   }
 
+  async function getFavorites(ownerPubkey) {
+    if (!isReady() || !ownerPubkey) return [];
+    try {
+      const r = await pool.query(
+        `SELECT target_address FROM echo_favorites WHERE owner_pubkey = $1 ORDER BY created_at DESC`,
+        [ownerPubkey]
+      );
+      return r.rows.map((row) => row.target_address);
+    } catch (e) {
+      console.error("[echo-store] getFavorites error:", e.message);
+      return [];
+    }
+  }
+
+  async function addFavorite(ownerPubkey, targetAddress) {
+    if (!isReady() || !ownerPubkey || !targetAddress) return;
+    await pool.query(
+      `INSERT INTO echo_favorites (owner_pubkey, target_address)
+       VALUES ($1, $2)
+       ON CONFLICT (owner_pubkey, target_address) DO NOTHING`,
+      [ownerPubkey, targetAddress]
+    );
+  }
+
+  async function removeFavorite(ownerPubkey, targetAddress) {
+    if (!isReady() || !ownerPubkey || !targetAddress) return;
+    await pool.query(
+      `DELETE FROM echo_favorites WHERE owner_pubkey = $1 AND target_address = $2`,
+      [ownerPubkey, targetAddress]
+    );
+  }
+
+  // Staging-only seed: inserts demo favorites for the demo viewer so the
+  // leaderboard preview renders pinned rows without any interaction needed.
+  // Both targets are seeded by seedStagingLeaderboard so they appear in the list.
+  async function seedStagingFavorites(ownerPubkey) {
+    if (!isStaging || !isReady() || !ownerPubkey) return;
+    const targets = ["staging-demo-gamma", "staging-demo-beta"];
+    for (const target of targets) {
+      await pool.query(
+        `INSERT INTO echo_favorites (owner_pubkey, target_address)
+         VALUES ($1, $2)
+         ON CONFLICT (owner_pubkey, target_address) DO NOTHING`,
+        [ownerPubkey, target]
+      );
+    }
+    console.log("[echo-store] staging favorites seed applied");
+  }
+
   async function prune() {
     if (!isReady()) return;
     // Age-based prune across all chains.
@@ -686,10 +746,21 @@ function createEchoStore(opts = {}) {
     }
   }
 
-  // Top senders ranked by total confirmed tokens. Returns [] when disabled.
-  async function queryLeaderboard(chainId, limit = 20) {
-    if (!isReady()) return [];
+  // Top senders ranked by total confirmed tokens. Returns { rows, partialInMemory }
+  // when disabled returns { rows: [], partialInMemory: false }.
+  // window: 'all' (default) | '1d' (last 24 h) | '7d' (last 7 days)
+  async function queryLeaderboard(chainId, limit = 20, window = "all") {
+    if (!isReady()) return { rows: [], partialInMemory: false };
     const lim = Math.max(1, Math.min(100, limit || 20));
+    const params = [chainId || null];
+    let timeFilter = "";
+    if (window === "1d") {
+      params.push(Date.now() - 86400000);
+      timeFilter = `AND echo_confirmed_ts >= $${params.length}`;
+    } else if (window === "7d") {
+      params.push(Date.now() - 7 * 86400000);
+      timeFilter = `AND echo_confirmed_ts >= $${params.length}`;
+    }
     const sql = `
       SELECT
         e.request_from AS address,
@@ -704,23 +775,27 @@ function createEchoStore(opts = {}) {
       FROM echo_events e
       LEFT JOIN echo_identities id ON id.address = e.request_from
       WHERE e.chain_id IS NOT DISTINCT FROM $1
+      ${timeFilter}
       GROUP BY e.request_from, id.username
       HAVING COUNT(*) FILTER (WHERE e.status = 'confirmed') > 0
       ORDER BY tokens_sent DESC
-      LIMIT $2
+      LIMIT ${lim}
     `;
     try {
-      const r = await pool.query(sql, [chainId || null, lim]);
-      return r.rows.map((row) => ({
-        address: row.address,
-        tokensSent: numOrNull(row.tokens_sent) || 0,
-        echoCount: row.echo_count || 0,
-        avgLatencyMs: numOrNull(row.avg_latency_ms),
-        username: row.username || null,
-      }));
+      const r = await pool.query(sql, params);
+      return {
+        rows: r.rows.map((row) => ({
+          address: row.address,
+          tokensSent: numOrNull(row.tokens_sent) || 0,
+          echoCount: row.echo_count || 0,
+          avgLatencyMs: numOrNull(row.avg_latency_ms),
+          username: row.username || null,
+        })),
+        partialInMemory: false,
+      };
     } catch (e) {
       console.error("[echo-store] queryLeaderboard error:", e.message);
-      return [];
+      return { rows: [], partialInMemory: false };
     }
   }
 
@@ -936,6 +1011,42 @@ function createEchoStore(opts = {}) {
       }
     }
     if (lbSeeded > 0) console.log(`[echo-store] seeded ${lbSeeded} staging leaderboard demo rows`);
+
+    // Recent leaderboard rows — timestamps within the past few hours so the
+    // "Today" time-window tab shows non-empty data. txIds are date-scoped so
+    // each day's container boot inserts fresh rows (idempotent within a day).
+    const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const nowMs = Date.now();
+    const RECENT_LB_SENDERS = [
+      { suffix: "ra", count: 3, amount: 12 },
+      { suffix: "rb", count: 2, amount: 8  },
+      { suffix: "rc", count: 5, amount: 5  },
+    ];
+    let recentSeeded = 0;
+    for (const s of RECENT_LB_SENDERS) {
+      const addr = `ut1lbrecent${s.suffix}00000000000000000000000000000000000000000`;
+      for (let i = 0; i < s.count; i++) {
+        const reqTs  = nowMs - 3_600_000 - i * 900_000; // 1–4h ago
+        const echoTs = reqTs + 28_000;
+        const txId   = `staging-lb-today-${todayStr}-${s.suffix}-${String(i).padStart(3, "0")}`;
+        try {
+          const { rowCount } = await pool.query(
+            `INSERT INTO echo_events
+               (request_tx_id, chain_id, request_from, request_amount, echo_amount,
+                status, request_ts, request_seen_at_ms,
+                echo_confirmed_ts, echo_confirmed_at_ms, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$8,$9,$9)
+             ON CONFLICT (request_tx_id) DO NOTHING`,
+            [txId, chainId || null, addr, s.amount, s.amount - 1, "confirmed",
+             reqTs, echoTs, new Date(reqTs)]
+          );
+          recentSeeded += rowCount || 0;
+        } catch (e) {
+          console.warn("[echo-store] recent lb seed row failed:", e.message);
+        }
+      }
+    }
+    if (recentSeeded > 0) console.log(`[echo-store] seeded ${recentSeeded} recent leaderboard demo rows`);
   }
 
   async function close() {
@@ -949,7 +1060,8 @@ function createEchoStore(opts = {}) {
            getLeaderboard, queryUserStats, queryUserLatencyHistory,
            getSuccessRateBuckets, queryLeaderboard,
            recordIdentity, lookupIdentity,
-           seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
+           getFavorites, addFavorite, removeFavorite,
+           seedStagingLeaderboard, seedStagingDemo, seedStagingFavorites, seedStaging, prune, close };
 }
 
 module.exports = createEchoStore;

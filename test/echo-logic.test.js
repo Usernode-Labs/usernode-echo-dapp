@@ -20,7 +20,41 @@ function notReadyStore() {
     async queryStats() { return null; },
     async queryUserStats() { return null; },
     async seedStagingDemo() {},
+    async getFavorites() { return []; },
+    async addFavorite() {},
+    async removeFavorite() {},
     async close() {},
+    lookupIdentity() { return null; },
+    recordIdentity() {},
+  };
+}
+
+// Store stub that IS ready and tracks favorites in memory.
+function favoritesStore() {
+  const db = new Map(); // ownerPubkey -> Set<targetAddress>
+  return {
+    async init() {},
+    isReady() { return true; },
+    persist() {},
+    async hydrate() { return []; },
+    async queryHistory() { return null; },
+    async queryStats() { return null; },
+    async queryUserStats() { return null; },
+    async seedStagingDemo() {},
+    async getFavorites(ownerPubkey) {
+      return [...(db.get(ownerPubkey) || new Set())];
+    },
+    async addFavorite(ownerPubkey, targetAddress) {
+      if (!db.has(ownerPubkey)) db.set(ownerPubkey, new Set());
+      db.get(ownerPubkey).add(targetAddress);
+    },
+    async removeFavorite(ownerPubkey, targetAddress) {
+      const s = db.get(ownerPubkey);
+      if (s) s.delete(targetAddress);
+    },
+    async close() {},
+    lookupIdentity() { return null; },
+    recordIdentity() {},
   };
 }
 
@@ -156,4 +190,185 @@ test("handleRequest routes /__echo/my-stats", async () => {
   await new Promise((r) => setImmediate(r));
   assert.equal(res.ended, true);
   assert.equal(res.headers["Cache-Control"], "no-store");
+});
+
+// ── Favorites endpoints ───────────────────────────────────────────────────────
+
+function makeEchoWithFavStore() {
+  return createEcho({
+    appPubkey: "ut1echoapp",
+    localDev: true,
+    store: favoritesStore(),
+  });
+}
+
+test("GET /__echo/favorites returns [] for anonymous (no req.user)", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleGetFavorites({ url: "/__echo/favorites", method: "GET" }, res);
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.deepEqual(body.favorites, []);
+});
+
+test("GET /__echo/favorites returns the caller's favorites when authenticated", async () => {
+  const echo = makeEchoWithFavStore();
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: "ut1owner" },
+      body: { address: "ut1target" },
+    },
+    mockRes()
+  );
+  const res = mockRes();
+  await echo._test.handleGetFavorites(
+    { url: "/__echo/favorites", method: "GET", user: { usernode_pubkey: "ut1owner" } },
+    res
+  );
+  const body = JSON.parse(res.body);
+  assert.ok(body.favorites.includes("ut1target"));
+});
+
+test("GET /__echo/favorites ?demo=1 maps to DEMO_STATS_PUBKEY", async () => {
+  const DEMO_STATS_PUBKEY = createEcho.DEMO_STATS_PUBKEY;
+  const echo = makeEchoWithFavStore();
+  // Seed a favorite for DEMO_STATS_PUBKEY via POST.
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: DEMO_STATS_PUBKEY },
+      body: { address: "ut1anydemo" },
+    },
+    mockRes()
+  );
+  const res = mockRes();
+  await echo._test.handleGetFavorites(
+    { url: "/__echo/favorites?demo=1", method: "GET" },
+    res
+  );
+  const body = JSON.parse(res.body);
+  assert.ok(body.favorites.includes("ut1anydemo"), "demo shim should return DEMO_STATS_PUBKEY favorites");
+});
+
+test("POST /__echo/favorites without identity returns 401", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleAddFavorite(
+    { url: "/__echo/favorites", method: "POST", body: { address: "ut1target" } },
+    res
+  );
+  assert.equal(res.statusCode, 401);
+});
+
+test("POST /__echo/favorites with own pubkey returns 400", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: "ut1self" },
+      body: { address: "ut1self" },
+    },
+    res
+  );
+  assert.equal(res.statusCode, 400);
+  assert.ok(JSON.parse(res.body).error.includes("yourself"));
+});
+
+test("POST /__echo/favorites with missing address returns 400", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: "ut1owner" },
+      body: {},
+    },
+    res
+  );
+  assert.equal(res.statusCode, 400);
+});
+
+test("POST /__echo/favorites happy path adds favorite", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: "ut1owner" },
+      body: { address: "ut1target" },
+    },
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).ok, true);
+  // Verify the favorite was actually stored.
+  const getRes = mockRes();
+  await echo._test.handleGetFavorites(
+    { url: "/__echo/favorites", method: "GET", user: { usernode_pubkey: "ut1owner" } },
+    getRes
+  );
+  assert.ok(JSON.parse(getRes.body).favorites.includes("ut1target"));
+});
+
+test("DELETE /__echo/favorites without identity returns 401", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  await echo._test.handleRemoveFavorite(
+    { url: "/__echo/favorites?address=ut1target", method: "DELETE" },
+    res
+  );
+  assert.equal(res.statusCode, 401);
+});
+
+test("DELETE /__echo/favorites happy path removes favorite", async () => {
+  const echo = makeEchoWithFavStore();
+  // Add first.
+  await echo._test.handleAddFavorite(
+    {
+      url: "/__echo/favorites",
+      method: "POST",
+      user: { usernode_pubkey: "ut1owner" },
+      body: { address: "ut1target" },
+    },
+    mockRes()
+  );
+  // Now remove.
+  const delRes = mockRes();
+  await echo._test.handleRemoveFavorite(
+    {
+      url: "/__echo/favorites?address=ut1target",
+      method: "DELETE",
+      user: { usernode_pubkey: "ut1owner" },
+    },
+    delRes
+  );
+  assert.equal(delRes.statusCode, 200);
+  assert.equal(JSON.parse(delRes.body).ok, true);
+  // Verify removed.
+  const getRes = mockRes();
+  await echo._test.handleGetFavorites(
+    { url: "/__echo/favorites", method: "GET", user: { usernode_pubkey: "ut1owner" } },
+    getRes
+  );
+  assert.deepEqual(JSON.parse(getRes.body).favorites, []);
+});
+
+test("handleRequest routes /__echo/favorites GET", async () => {
+  const echo = makeEchoWithFavStore();
+  const res = mockRes();
+  const handled = echo.handleRequest(
+    { url: "/__echo/favorites", method: "GET" },
+    res,
+    "/__echo/favorites"
+  );
+  assert.equal(handled, true);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(res.ended, true);
 });

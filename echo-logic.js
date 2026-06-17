@@ -964,6 +964,30 @@ function createEcho(opts) {
     res.end(body);
   }
 
+  // Reads the JSON body from a raw Node.js request. Checks req.body first so
+  // test code can inject a plain object without simulating a stream.
+  function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+      if (req.body !== undefined) {
+        resolve(req.body && typeof req.body === "object" ? req.body : {});
+        return;
+      }
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk.toString();
+        if (raw.length > 4096) {
+          reject(new Error("body too large"));
+          if (typeof req.destroy === "function") req.destroy();
+        }
+      });
+      req.on("end", () => {
+        try { resolve(JSON.parse(raw || "{}")); }
+        catch (_) { resolve({}); }
+      });
+      req.on("error", reject);
+    });
+  }
+
   // Operator-facing JSON: no permissive CORS header (unlike /__echo/state),
   // and never any per-user field (anomaly rows are aggregate; request_from
   // lives only in the private echo_samples table).
@@ -1016,13 +1040,6 @@ function createEcho(opts) {
     sendJson(req, res, { events: events_, nextCursor, stats, mode });
   }
 
-  async function handleLeaderboard(req, res) {
-    if (req.method === "HEAD") { res.writeHead(200); res.end(); return; }
-    const cid = effectiveChainId();
-    const entries = store.isReady() ? await store.getLeaderboard(cid) : [];
-    sendJson(req, res, { entries, chainId: cid });
-  }
-
   // Human-readable labels for each metric key. Mirrors METRICS in echo-metrics.js
   // plus the two threshold-only metrics that aren't in that map.
   const ANOMALY_METRIC_LABELS = {
@@ -1071,6 +1088,7 @@ function createEcho(opts) {
     const anomalies = open.concat(resolved).slice(0, 50);
     sendJson(req, res, { openCount: open.length, anomalies });
   }
+
 
   // Public per-user aggregate: GET /__echo/my-stats?address=<pubkey>. Same
   // posture as /__echo/state and /__echo/history (no /api/ prefix, no auth,
@@ -1179,13 +1197,19 @@ function createEcho(opts) {
   }
 
   // In-memory leaderboard fallback: aggregate confirmed events from the Map.
-  function computeLeaderboardFromMemory(limit) {
+  // window: 'all' (default) | '1d' (last 24 h) | '7d' (last 7 days)
+  function computeLeaderboardFromMemory(limit, window) {
     const lim = Math.max(1, Math.min(100, limit || 20));
+    const now = Date.now();
+    const cutoffMs = window === "1d" ? now - 86400000
+                   : window === "7d" ? now - 7 * 86400000
+                   : null;
     const byAddress = new Map();
     for (const ev of events.values()) {
       if (ev.status !== "confirmed") continue;
       const addr = ev.requestFrom;
       if (!addr) continue;
+      if (cutoffMs !== null && (ev.echoConfirmedTs == null || ev.echoConfirmedTs < cutoffMs)) continue;
       if (!byAddress.has(addr)) byAddress.set(addr, { tokensSent: 0, echoCount: 0, latSum: 0, latCount: 0 });
       const a = byAddress.get(addr);
       a.tokensSent += ev.requestAmount || 0;
@@ -1227,15 +1251,25 @@ function createEcho(opts) {
   }
 
   async function handleLeaderboard(req, res) {
+    let window = "all";
+    try {
+      const u = new URL(req.url, "http://x");
+      const w = u.searchParams.get("window");
+      if (w === "1d" || w === "7d") window = w;
+    } catch (_) {}
+
     const cid  = effectiveChainId();
     const mode = localDev ? "mock" : "chain";
-    let entries;
+    let rows, partialInMemory;
     if (store.isReady()) {
-      entries = await store.queryLeaderboard(cid, 20);
+      const result = await store.queryLeaderboard(cid, 20, window);
+      rows = result.rows;
+      partialInMemory = result.partialInMemory;
     } else {
-      entries = computeLeaderboardFromMemory(20);
+      rows = computeLeaderboardFromMemory(20, window);
+      partialInMemory = true;
     }
-    sendJson(req, res, { entries, chainId: cid, count: entries.length, mode });
+    sendJson(req, res, { rows, window, partialInMemory, chainId: cid, count: rows.length, mode });
   }
 
   // Capture the viewer's Usernode username (set by the JWT-verifying
@@ -1250,8 +1284,122 @@ function createEcho(opts) {
     if (addr && name) store.recordIdentity(addr, name);
   }
 
+  // GET /__echo/favorites — returns the caller's favorite leaderboard addresses.
+  // Public: anonymous callers get an empty list; authenticated callers get their
+  // own set (or the demo set when ?demo=1). Never exposes another user's list.
+  async function handleGetFavorites(req, res) {
+    let ownerPubkey = null;
+    try {
+      const u = new URL(req.url, "http://x");
+      if (u.searchParams.get("demo") === "1") {
+        ownerPubkey = DEMO_STATS_PUBKEY;
+      } else {
+        const usr = req.user;
+        if (usr) ownerPubkey = usr.usernode_pubkey || usr.usernodePubkey || null;
+      }
+    } catch (_) {}
+    const favorites = (ownerPubkey && store.isReady())
+      ? await store.getFavorites(ownerPubkey)
+      : [];
+    sendJson(req, res, { favorites });
+  }
+
+  // POST /__echo/favorites — body: { address }. Requires identity (the one
+  // narrow write exception to echo's fully-public posture — see CLAUDE.md).
+  async function handleAddFavorite(req, res) {
+    const usr = req.user;
+    const ownerPubkey = usr ? (usr.usernode_pubkey || usr.usernodePubkey || null) : null;
+    if (!ownerPubkey) {
+      res.writeHead(401, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "authentication required" }));
+      return;
+    }
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (_) { body = {}; }
+    const targetAddress = typeof body.address === "string" ? body.address.trim() : "";
+    if (!targetAddress) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "address required" }));
+      return;
+    }
+    if (targetAddress === ownerPubkey) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "cannot favorite yourself" }));
+      return;
+    }
+    if (!store.isReady()) {
+      res.writeHead(503, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "favorites unavailable (no database)" }));
+      return;
+    }
+    await store.addFavorite(ownerPubkey, targetAddress);
+    sendJson(req, res, { ok: true });
+  }
+
+  // DELETE /__echo/favorites?address=… — requires identity.
+  async function handleRemoveFavorite(req, res) {
+    const usr = req.user;
+    const ownerPubkey = usr ? (usr.usernode_pubkey || usr.usernodePubkey || null) : null;
+    if (!ownerPubkey) {
+      res.writeHead(401, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "authentication required" }));
+      return;
+    }
+    let targetAddress = "";
+    try {
+      const u = new URL(req.url, "http://x");
+      targetAddress = (u.searchParams.get("address") || "").trim();
+    } catch (_) {}
+    if (!targetAddress) {
+      res.writeHead(400, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "address required" }));
+      return;
+    }
+    if (!store.isReady()) {
+      res.writeHead(503, JSON_HEADERS);
+      res.end(JSON.stringify({ error: "favorites unavailable (no database)" }));
+      return;
+    }
+    await store.removeFavorite(ownerPubkey, targetAddress);
+    sendJson(req, res, { ok: true });
+  }
+
   function handleRequest(req, res, pathname) {
     if (pathname.startsWith("/__echo/")) captureIdentity(req);
+    if (pathname === "/__echo/favorites") {
+      if (req.method === "GET" || req.method === "HEAD") {
+        if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
+        handleGetFavorites(req, res).catch((e) => {
+          console.error("[echo] favorites error:", e.message);
+          if (!res.headersSent) {
+            res.writeHead(500, JSON_HEADERS);
+            res.end(JSON.stringify({ error: "favorites unavailable" }));
+          }
+        });
+        return true;
+      }
+      if (req.method === "POST") {
+        handleAddFavorite(req, res).catch((e) => {
+          console.error("[echo] add-favorite error:", e.message);
+          if (!res.headersSent) {
+            res.writeHead(500, JSON_HEADERS);
+            res.end(JSON.stringify({ error: "favorites unavailable" }));
+          }
+        });
+        return true;
+      }
+      if (req.method === "DELETE") {
+        handleRemoveFavorite(req, res).catch((e) => {
+          console.error("[echo] remove-favorite error:", e.message);
+          if (!res.headersSent) {
+            res.writeHead(500, JSON_HEADERS);
+            res.end(JSON.stringify({ error: "favorites unavailable" }));
+          }
+        });
+        return true;
+      }
+    }
     if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
       if (req.method === "HEAD") { res.writeHead(200, JSON_HEADERS); res.end(); return true; }
       handleLeaderboard(req, res).catch((e) => {
@@ -1332,16 +1480,6 @@ function createEcho(opts) {
       });
       return true;
     }
-    if (pathname === "/__echo/leaderboard" && (req.method === "GET" || req.method === "HEAD")) {
-      handleLeaderboard(req, res).catch((e) => {
-        console.error("[echo] leaderboard error:", e.message);
-        if (!res.headersSent) {
-          res.writeHead(500, JSON_HEADERS);
-          res.end(JSON.stringify({ error: "leaderboard unavailable" }));
-        }
-      });
-      return true;
-    }
     return false;
   }
 
@@ -1416,6 +1554,11 @@ function createEcho(opts) {
         store.seedStagingLeaderboard(effectiveChainId()).catch((e) => {
           console.warn("[echo] staging leaderboard seed failed:", e.message);
         });
+        if (typeof store.seedStagingFavorites === "function") {
+          store.seedStagingFavorites(DEMO_STATS_PUBKEY).catch((e) => {
+            console.warn("[echo] staging favorites seed failed:", e.message);
+          });
+        }
       }
     })();
 
@@ -1473,6 +1616,9 @@ function createEcho(opts) {
       events,
       computeUserStatsFromMemory,
       handleUserStats,
+      handleGetFavorites,
+      handleAddFavorite,
+      handleRemoveFavorite,
     },
   };
 }
