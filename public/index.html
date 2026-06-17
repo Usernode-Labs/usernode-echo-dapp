@@ -467,8 +467,7 @@
 
     /* Leaderboard card */
     .lb-row {
-      display: grid;
-      grid-template-columns: 28px 1fr auto auto auto;
+      display: flex;
       align-items: center;
       gap: 8px;
       padding: 7px 4px;
@@ -485,12 +484,13 @@
     .lb-rank {
       font-size: 11px; font-weight: 700;
       color: var(--muted); text-align: center;
+      flex: 0 0 28px;
     }
     .lb-rank-top { color: var(--accent-text); }
-    .lb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); }
-    .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; }
-    .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .lb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+    .lb-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; color: var(--fg); flex: 0 0 auto; }
+    .lb-echoes { font-size: 11px; color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
+    .lb-latency { font-size: 11px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 
     /* Leaderboard star button */
     .lb-star-btn {
