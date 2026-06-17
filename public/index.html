@@ -72,6 +72,17 @@
       display: inline-block; text-align: center;
       white-space: nowrap; flex-shrink: 0;
     }
+    .pingPill {
+      font-size: 11px; font-weight: 600;
+      padding: 3px 10px; border-radius: 999px;
+      display: inline-block; text-align: center;
+      white-space: nowrap; flex-shrink: 0;
+      border: 1px solid transparent;
+    }
+    .pingPill.loading { background: var(--chip-bg); color: var(--muted); }
+    .pingPill.ok  { background: rgba(52, 211, 153, 0.16); color: var(--ok);   border-color: rgba(52, 211, 153, 0.25); }
+    .pingPill.slow{ background: rgba(251, 191, 36, 0.15); color: var(--warn); border-color: rgba(251, 191, 36, 0.25); }
+    .pingPill.err { background: rgba(251, 113, 133, 0.16); color: var(--err); border-color: rgba(251, 113, 133, 0.25); }
     .healthBanner {
       font-size: 12px; font-weight: 600;
       padding: 8px 16px; text-align: center;
@@ -532,7 +543,10 @@
         <h1>Echo</h1>
         <div class="sub">Send N tokens, get N-1 back. Measures sidecar round-trip latency.</div>
       </div>
-      <span class="modePill" id="modePill">…</span>
+      <div style="display:flex; align-items:center; gap:8px">
+        <span class="pingPill loading" id="pingPill">—</span>
+        <span class="modePill" id="modePill">…</span>
+      </div>
     </div>
   </div>
 
@@ -3237,6 +3251,32 @@
       } catch (_) {}
     }
 
+    /* ── Server latency ping ──────────────────────────────────
+       Measures raw HTTP round-trip to /health every 5 s and
+       updates the #pingPill in the top bar. */
+    const PING_SLOW_THRESHOLD_MS = 800;
+    const pingPillEl = document.getElementById("pingPill");
+    async function pingServer() {
+      const t0 = performance.now();
+      try {
+        let fetchOpts = { cache: "no-store" };
+        try { fetchOpts.signal = AbortSignal.timeout(3000); } catch (_) {}
+        const r = await fetch("/health", fetchOpts);
+        if (!r.ok) throw new Error("non-2xx");
+        const rtt = Math.round(performance.now() - t0);
+        if (rtt < PING_SLOW_THRESHOLD_MS) {
+          pingPillEl.className = "pingPill ok";
+          pingPillEl.textContent = "Operational · " + rtt + "ms";
+        } else {
+          pingPillEl.className = "pingPill slow";
+          pingPillEl.textContent = "Slow · " + rtt + "ms";
+        }
+      } catch (_) {
+        pingPillEl.className = "pingPill err";
+        pingPillEl.textContent = "Offline";
+      }
+    }
+
     /* ── Server state polling ─────────────────────────────── */
     async function pollServerState() {
       // Fire when there are actively-tracked echoes OR when any "checking"
@@ -3523,6 +3563,10 @@
       // even when there are no pending echoes (pollServerState idles then).
       setInterval(pollHealth, 10000);
       pollHealth();
+
+      // Latency ping: measures raw HTTP round-trip to /health every 5 s.
+      setInterval(pingServer, 5000);
+      pingServer();
 
       // 1-second countdown tick: updates the "Retrying in Xs…" line on the
       // latest card between server polls so the countdown stays live.
