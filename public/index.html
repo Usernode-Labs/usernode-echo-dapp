@@ -109,10 +109,13 @@
     .healthBanner {
       font-size: 12px; font-weight: 600;
       padding: 8px 16px; text-align: center;
-      border-bottom: 1px solid var(--border);
-      color: #92400e; background: #fef3c7;
+      border-bottom: 1px solid rgba(251, 191, 36, 0.25);
+      color: var(--warn); background: rgba(251, 191, 36, 0.10);
     }
-    .healthBanner.critical { color: #7f1d1d; background: #fee2e2; }
+    .healthBanner.critical {
+      border-bottom-color: rgba(251, 113, 133, 0.25);
+      color: var(--err); background: rgba(251, 113, 133, 0.10);
+    }
     .healthBanner.hide { display: none; }
     .scrollArea {
       flex: 1 1 auto; overflow-y: auto; min-height: 0;
@@ -501,7 +504,7 @@
     }
     .lb-tab.active {
       background: var(--accent); border-color: var(--accent);
-      color: var(--accent-text);
+      color: #fff;
     }
     .lb-partial-note {
       font-size: 11px; color: var(--muted); margin-top: 8px; text-align: center;
@@ -2735,10 +2738,9 @@
     function initSuccessRateChart() {
       const canvas = document.getElementById("successRateChart");
       if (!canvas || !window.Chart) return null;
-      const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      const barColor  = isDark ? "rgba(93,211,158,0.75)"    : "rgba(15,118,110,0.75)";
-      const gridColor = isDark ? "rgba(255,255,255,0.08)"   : "rgba(0,0,0,0.06)";
-      const tickColor = isDark ? "#a8b3c7"                  : "#4b5568";
+      const barColor  = "rgba(93,211,158,0.75)";
+      const gridColor = "rgba(255,255,255,0.08)";
+      const tickColor = "#a8b3c7";
       return new window.Chart(canvas, {
         type: "bar",
         data: {
@@ -2860,9 +2862,8 @@
     function initLatencyChart() {
       const canvas = document.getElementById("latencyChart");
       if (!canvas || !window.Chart) return null;
-      const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      const gridColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)";
-      const tickColor = isDark ? "#a8b3c7" : "#4b5568";
+      const gridColor = "rgba(255,255,255,0.08)";
+      const tickColor = "#a8b3c7";
       return new window.Chart(canvas, {
         type: "bar",
         data: {
