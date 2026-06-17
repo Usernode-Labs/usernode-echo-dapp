@@ -12,13 +12,16 @@ const createEchoStore = require("../echo-store");
 // Minimal fake pg pool. Routes queries by SQL substring; records UPSERT params.
 function makeFakePool({ aggregateRow, existsRowCount = 0 } = {}) {
   const calls = { inserts: [], queries: [] };
+  // In-memory favorites store so the favorites round-trip tests work.
+  const favorites = new Map(); // "owner|target" -> true
   return {
     calls,
+    favorites,
     on() {},
     async end() {},
     async query(sql, params) {
       calls.queries.push({ sql, params });
-      if (/CREATE TABLE/i.test(sql)) return { rows: [], rowCount: 0 };
+      if (/CREATE TABLE|COMMENT ON TABLE|CREATE INDEX/i.test(sql)) return { rows: [], rowCount: 0 };
       if (/SELECT 1 FROM echo_events/i.test(sql)) {
         return { rows: existsRowCount ? [{ "?column?": 1 }] : [], rowCount: existsRowCount };
       }
@@ -28,6 +31,28 @@ function makeFakePool({ aggregateRow, existsRowCount = 0 } = {}) {
       }
       if (/WITH recent AS/i.test(sql)) {
         return { rows: [aggregateRow || {}] };
+      }
+      // Favorites queries
+      if (/INSERT INTO echo_favorites/i.test(sql)) {
+        const key = params[0] + "|" + params[1];
+        const isNew = !favorites.has(key);
+        favorites.set(key, true);
+        return { rows: [], rowCount: isNew ? 1 : 0 };
+      }
+      if (/DELETE FROM echo_favorites/i.test(sql)) {
+        const key = params[0] + "|" + params[1];
+        const had = favorites.has(key);
+        favorites.delete(key);
+        return { rows: [], rowCount: had ? 1 : 0 };
+      }
+      if (/SELECT target_address FROM echo_favorites/i.test(sql)) {
+        const owner = params[0];
+        const rows = [];
+        for (const key of favorites.keys()) {
+          const [o, t] = key.split("|");
+          if (o === owner) rows.push({ target_address: t });
+        }
+        return { rows, rowCount: rows.length };
       }
       return { rows: [], rowCount: 0 };
     },
@@ -186,4 +211,76 @@ test("seedStagingDemo is a strict no-op outside staging", async () => {
   await store.init();
   await store.seedStagingDemo("chainA", "ut1demo");
   assert.equal(pool.calls.inserts.length, 0);
+});
+
+// ── echo_favorites ────────────────────────────────────────────────────────────
+
+test("getFavorites returns [] when store is not ready", async () => {
+  const store = createEchoStore({ databaseUrl: "", isStaging: false });
+  // No init() — store stays disabled.
+  const favs = await store.getFavorites("ut1owner");
+  assert.deepEqual(favs, []);
+});
+
+test("addFavorite/getFavorites/removeFavorite round-trip", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+
+  await store.addFavorite("ut1owner", "ut1target");
+  let favs = await store.getFavorites("ut1owner");
+  assert.ok(favs.includes("ut1target"), "should contain the added target");
+
+  await store.removeFavorite("ut1owner", "ut1target");
+  favs = await store.getFavorites("ut1owner");
+  assert.equal(favs.length, 0, "should be empty after removal");
+});
+
+test("addFavorite is idempotent (ON CONFLICT DO NOTHING)", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+
+  await store.addFavorite("ut1owner", "ut1target");
+  await store.addFavorite("ut1owner", "ut1target"); // second add — no throw, no duplicate
+  const favs = await store.getFavorites("ut1owner");
+  assert.equal(favs.filter((a) => a === "ut1target").length, 1, "only one entry");
+});
+
+test("getFavorites scopes to the requesting owner", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x" });
+  await store.init();
+
+  await store.addFavorite("ut1alice", "ut1shared");
+  await store.addFavorite("ut1bob", "ut1shared");
+
+  const aliceFavs = await store.getFavorites("ut1alice");
+  const bobFavs   = await store.getFavorites("ut1bob");
+  assert.ok(aliceFavs.includes("ut1shared"));
+  assert.ok(bobFavs.includes("ut1shared"));
+  // Neither owner's list bleeds into the other.
+  assert.equal(aliceFavs.length, 1);
+  assert.equal(bobFavs.length, 1);
+});
+
+test("seedStagingFavorites is a no-op outside staging", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x", isStaging: false });
+  await store.init();
+  await store.seedStagingFavorites("ut1demoowner");
+  // No INSERT INTO echo_favorites queries should have been issued.
+  const favInserts = pool.calls.queries.filter((q) => /INSERT INTO echo_favorites/i.test(q.sql));
+  assert.equal(favInserts.length, 0);
+});
+
+test("seedStagingFavorites inserts two demo favorites in staging", async () => {
+  const pool = makeFakePool({});
+  const store = createEchoStore({ pool, databaseUrl: "x", isStaging: true });
+  await store.init();
+  await store.seedStagingFavorites("ut1demoowner");
+  const favs = await store.getFavorites("ut1demoowner");
+  assert.ok(favs.includes("staging-demo-gamma"), "should contain staging-demo-gamma");
+  assert.ok(favs.includes("staging-demo-beta"), "should contain staging-demo-beta");
+  assert.equal(favs.length, 2);
 });

@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS echo_identities (
   username     TEXT NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Per-user leaderboard favorites. staging:private — each row reveals only
+-- the owner's personal preference; never included in any public API response.
+CREATE TABLE IF NOT EXISTS echo_favorites (
+  owner_pubkey   TEXT NOT NULL,
+  target_address TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (owner_pubkey, target_address)
+);
+COMMENT ON TABLE echo_favorites IS 'staging:private';
+CREATE INDEX IF NOT EXISTS echo_favorites_owner_idx ON echo_favorites (owner_pubkey);
 `;
 
 // Column order shared by INSERT params and rowToEvent.
@@ -615,6 +626,55 @@ function createEchoStore(opts = {}) {
     }
   }
 
+  async function getFavorites(ownerPubkey) {
+    if (!isReady() || !ownerPubkey) return [];
+    try {
+      const r = await pool.query(
+        `SELECT target_address FROM echo_favorites WHERE owner_pubkey = $1 ORDER BY created_at DESC`,
+        [ownerPubkey]
+      );
+      return r.rows.map((row) => row.target_address);
+    } catch (e) {
+      console.error("[echo-store] getFavorites error:", e.message);
+      return [];
+    }
+  }
+
+  async function addFavorite(ownerPubkey, targetAddress) {
+    if (!isReady() || !ownerPubkey || !targetAddress) return;
+    await pool.query(
+      `INSERT INTO echo_favorites (owner_pubkey, target_address)
+       VALUES ($1, $2)
+       ON CONFLICT (owner_pubkey, target_address) DO NOTHING`,
+      [ownerPubkey, targetAddress]
+    );
+  }
+
+  async function removeFavorite(ownerPubkey, targetAddress) {
+    if (!isReady() || !ownerPubkey || !targetAddress) return;
+    await pool.query(
+      `DELETE FROM echo_favorites WHERE owner_pubkey = $1 AND target_address = $2`,
+      [ownerPubkey, targetAddress]
+    );
+  }
+
+  // Staging-only seed: inserts demo favorites for the demo viewer so the
+  // leaderboard preview renders pinned rows without any interaction needed.
+  // Both targets are seeded by seedStagingLeaderboard so they appear in the list.
+  async function seedStagingFavorites(ownerPubkey) {
+    if (!isStaging || !isReady() || !ownerPubkey) return;
+    const targets = ["staging-demo-gamma", "staging-demo-beta"];
+    for (const target of targets) {
+      await pool.query(
+        `INSERT INTO echo_favorites (owner_pubkey, target_address)
+         VALUES ($1, $2)
+         ON CONFLICT (owner_pubkey, target_address) DO NOTHING`,
+        [ownerPubkey, target]
+      );
+    }
+    console.log("[echo-store] staging favorites seed applied");
+  }
+
   async function prune() {
     if (!isReady()) return;
     // Age-based prune across all chains.
@@ -1000,7 +1060,8 @@ function createEchoStore(opts = {}) {
            getLeaderboard, queryUserStats, queryUserLatencyHistory,
            getSuccessRateBuckets, queryLeaderboard,
            recordIdentity, lookupIdentity,
-           seedStagingLeaderboard, seedStagingDemo, seedStaging, prune, close };
+           getFavorites, addFavorite, removeFavorite,
+           seedStagingLeaderboard, seedStagingDemo, seedStagingFavorites, seedStaging, prune, close };
 }
 
 module.exports = createEchoStore;
