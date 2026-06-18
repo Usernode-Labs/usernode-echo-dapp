@@ -36,6 +36,8 @@
       --accent: #7c3aed;        /* button / fill surfaces (white text on top) */
       --accent-hover: #8b54f0;
       --accent-text: #a78bfa;   /* accent as text/links on dark (readable) */
+      --accent-border: rgba(139, 92, 246, 0.30);
+      --accent-chip-bg: rgba(139, 92, 246, 0.12);
       --ok: #34d399;
       --warn: #fbbf24;
       --err: #fb7185;
@@ -47,21 +49,31 @@
       --bg: #050d1a; --card: #0c1629;
       --accent: #0e7fc4; --accent-hover: #2190cc; --accent-text: #67b8e8;
       --chip-bg: rgba(14, 127, 196, 0.16); --glow-color: rgba(14, 127, 196, 0.16);
+      --accent-border: rgba(14, 127, 196, 0.30); --accent-chip-bg: rgba(14, 127, 196, 0.12);
     }
     html[data-skin="forest"] {
       --bg: #080f0b; --card: #0c1510;
       --accent: #0f8e5b; --accent-hover: #22a06e; --accent-text: #6ed9a4;
       --chip-bg: rgba(15, 142, 91, 0.16); --glow-color: rgba(15, 142, 91, 0.16);
+      --accent-border: rgba(15, 142, 91, 0.30); --accent-chip-bg: rgba(15, 142, 91, 0.12);
     }
     html[data-skin="crimson"] {
       --bg: #100808; --card: #1a0e0e;
       --accent: #be2a2a; --accent-hover: #cc3d3d; --accent-text: #f07070;
       --chip-bg: rgba(190, 42, 42, 0.16); --glow-color: rgba(190, 42, 42, 0.16);
+      --accent-border: rgba(190, 42, 42, 0.30); --accent-chip-bg: rgba(190, 42, 42, 0.12);
     }
     html[data-skin="solar"] {
       --bg: #100c04; --card: #1a1208;
       --accent: #c47a0e; --accent-hover: #cf8e25; --accent-text: #e8be5a;
       --chip-bg: rgba(196, 122, 14, 0.16); --glow-color: rgba(196, 122, 14, 0.16);
+      --accent-border: rgba(196, 122, 14, 0.30); --accent-chip-bg: rgba(196, 122, 14, 0.12);
+    }
+    html[data-skin="darkblue"] {
+      --bg: #0b0d17; --card: #0f1628;
+      --accent: #1E40AF; --accent-hover: #1E3A8A; --accent-text: #93C5FD;
+      --chip-bg: rgba(30, 64, 175, 0.16); --glow-color: rgba(30, 64, 175, 0.16);
+      --accent-border: rgba(30, 64, 175, 0.30); --accent-chip-bg: rgba(30, 64, 175, 0.12);
     }
     /* ── Skin picker swatches ────────────────────────────────── */
     .skin-swatch {
@@ -102,7 +114,7 @@
       font-size: 11px; font-weight: 600;
       padding: 3px 10px; border-radius: 999px;
       background: var(--chip-bg); color: var(--accent-text);
-      border: 1px solid rgba(139, 92, 246, 0.30);
+      border: 1px solid var(--accent-border);
       display: inline-block; text-align: center;
       white-space: nowrap; flex-shrink: 0;
     }
@@ -224,7 +236,7 @@
       cursor: pointer; line-height: 1.4;
       transition: background-color 0.12s ease;
     }
-    .preset-btn:hover:not(:disabled) { background: rgba(124, 58, 237, 0.12); }
+    .preset-btn:hover:not(:disabled) { background: var(--accent-chip-bg); }
     .preset-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .hint {
       font-size: 12px; color: var(--muted); margin-top: 8px;
@@ -617,6 +629,7 @@
           <button class="skin-swatch" data-skin-id="forest"  title="Forest"  style="background:#0f8e5b"></button>
           <button class="skin-swatch" data-skin-id="crimson" title="Crimson" style="background:#be2a2a"></button>
           <button class="skin-swatch" data-skin-id="solar"   title="Solar"   style="background:#c47a0e"></button>
+          <button class="skin-swatch" data-skin-id="darkblue" title="Dark Blue" style="background:#1E40AF"></button>
         </div>
         <span class="pingPill loading" id="pingPill">—</span>
         <span class="modePill" id="modePill">…</span>
