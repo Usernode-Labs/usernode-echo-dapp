@@ -95,16 +95,18 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 // subsequent fetches). When present and valid we decode `req.user` so echo can
 // record the sender's real Usernode username for the leaderboard. A missing or
 // invalid token simply leaves `req.user` undefined; the request proceeds.
-// HS256 is verified with the built-in crypto module so we don't reintroduce a
-// `jsonwebtoken` dependency (see CLAUDE.md "Auth model").
-const JWT_SECRET = process.env.JWT_SECRET || "";
+// RS256 is verified with the built-in crypto module against the platform's
+// public key (USERNODE_JWT_PUBLIC_KEY) so we don't reintroduce a
+// `jsonwebtoken` dependency (see CLAUDE.md "Auth model"). The algorithm,
+// issuer and audience are pinned, and only `pur: "iframe"` tokens count.
+const USERNODE_JWT_PUBLIC_KEY = process.env.USERNODE_JWT_PUBLIC_KEY || "";
 
 function b64urlToBuf(s) {
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
-function verifyHs256Jwt(token, secret) {
-  if (!token || !secret) return null;
+function verifyRs256Jwt(token, publicKey) {
+  if (!token || !publicKey) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [headerB64, payloadB64, sigB64] = parts;
@@ -114,29 +116,39 @@ function verifyHs256Jwt(token, secret) {
   } catch (_) {
     return null;
   }
-  if (!header || header.alg !== "HS256") return null;
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest();
-  const given = b64urlToBuf(sigB64);
-  if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) {
+  if (!header || header.alg !== "RS256") return null;
+  let signatureOk = false;
+  try {
+    signatureOk = crypto
+      .createVerify("RSA-SHA256")
+      .update(`${headerB64}.${payloadB64}`)
+      .verify(publicKey, b64urlToBuf(sigB64));
+  } catch (_) {
     return null;
   }
+  if (!signatureOk) return null;
   let payload;
   try {
     payload = JSON.parse(b64urlToBuf(payloadB64).toString("utf8"));
   } catch (_) {
     return null;
   }
-  if (payload && payload.exp && Date.now() / 1000 > payload.exp) return null;
+  if (!payload) return null;
+  if (payload.exp && Date.now() / 1000 > payload.exp) return null;
+  if (payload.iss !== "usernode") return null;
+  const audience = "usernode:app:" + process.env.USERNODE_APP_ID;
+  const aud = payload.aud;
+  const audOk = Array.isArray(aud) ? aud.includes(audience) : aud === audience;
+  if (!audOk) return null;
+  // Platform iframe sessions only — anything else is not an app session.
+  if (payload.pur !== "iframe") return null;
   return payload;
 }
 
 app.use((req, _res, next) => {
   const token = req.query.token || req.headers["x-usernode-token"];
-  if (token && JWT_SECRET) {
-    const payload = verifyHs256Jwt(String(token), JWT_SECRET);
+  if (token && USERNODE_JWT_PUBLIC_KEY) {
+    const payload = verifyRs256Jwt(String(token), USERNODE_JWT_PUBLIC_KEY);
     if (payload) req.user = payload;
   }
   next();
