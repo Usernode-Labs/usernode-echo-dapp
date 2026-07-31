@@ -89,6 +89,11 @@ app.set("trust proxy", 1);
 // Health check — used by Docker healthcheck and platform polling.
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
+// Favicon — browsers request this on every page load. Answer with 204 so it
+// never falls through to the catch-all HTML shell (which would hand back an
+// HTML document for an icon request and log a console error).
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
+
 // ── Identity capture (non-gating) ─────────────────────────────────────────────
 // Echo is public and stays public — there is NO auth gate. But the platform
 // shell injects a signed session JWT (?token=… on load, x-usernode-token on
