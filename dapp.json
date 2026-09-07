@@ -31,5 +31,12 @@
       "required": false,
       "default": "0"
     }
+  ],
+  "tests": [
+    {
+      "name": "Home page shows footer note",
+      "path": "/",
+      "expectText": "added from claude.ai web via connector without gh!"
+    }
   ]
 }
