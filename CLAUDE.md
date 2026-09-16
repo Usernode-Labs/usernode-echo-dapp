@@ -26,7 +26,7 @@ conventions win.
   in-place — re-vendor from upstream when fixes land there.
 - `public/` — Single-file HTML/JS UI plus the shared `usernode-usernames.js`.
   The bridge is loaded from
-  `https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js` —
+  `/usernode-bridge/v1/bridge.js` (relative: the platform serves it on the app's own origin) —
   canonical source lives in the social-vibecoding repo at
   `public/usernode-bridge/v1/bridge.js`. Never vendor it per-app; bridge
   fixes ship from one SV redeploy, fleet-wide.
