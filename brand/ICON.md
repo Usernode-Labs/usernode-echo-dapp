@@ -4,13 +4,14 @@
 `dapp.json` as `"icon": { "image": "brand/icon.png" }`. The platform reads it at deploy time; the app never serves
 it, which is why it lives outside `public/`.
 
-It follows the shared Homeroom tile icon style (v1), so it sits with the
-other apps' icons as one set:
+It follows the Homeroom brand tile style (v2), so it sits with the other
+apps' icons as one set:
 
-- Glyph: Lucide `gauge` (white, 2px round strokes on the 24-unit grid),
-  centred in the middle 288 px of the tile, with a soft drop shadow.
-- Colour: slate, a diagonal gradient `#6A7B93` → `#27313F` (top left to
-  bottom right) under a faint top-left highlight.
+- Glyph: Lucide `radio`, drawn as an outlined sticker: a 3.6-unit black
+  stroke under a 1.7-unit yellow (`#FFEE6F`) stroke, round caps and joins,
+  280 px wide, centred slightly low and tilted -6°.
+- Colour: a flat black tile (`#000000`) from the brand palette. No
+  gradient, no shadow, no sparkle.
 - 512 × 512 PNG, full bleed, no text, no transparency. The platform rounds
   and crops the tile itself.
 
