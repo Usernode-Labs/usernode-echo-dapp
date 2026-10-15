@@ -10,7 +10,6 @@ in the Homeroom brand guidelines, so it sits with the other apps' icons:
 - Object: Lucide `radio` drawn as a solid object in charcoal (`#3A3A3A`, lit
   from the top left), with a #1B1B1B side face extruded toward the lower
   right and a thin ink (`#1D1B16`) outline.
-- Shadow: a flat ink shadow on the floor, falling to the lower right.
 - Tile: brand cream (`#FFFEEA`). No text.
 - 512 × 512 PNG, full bleed, no transparency. The platform rounds and crops
   the tile itself.
